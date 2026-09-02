@@ -1,0 +1,148 @@
+.app {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+.app--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-size: 1.1rem;
+}
+
+.app__header {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.app__header h1 {
+  font-family: Georgia, "Palatino Linotype", serif;
+  font-size: 2.4rem;
+  margin: 0 0 4px;
+  letter-spacing: 0.02em;
+  color: #e8c76f;
+}
+
+.app__tagline {
+  margin: 0;
+  color: #b8a98f;
+  font-size: 0.95rem;
+}
+
+.banner {
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
+.banner--error {
+  background: #4a1f1f;
+  border: 1px solid #8a3b3b;
+  color: #ffd4d4;
+}
+
+.layout {
+  display: flex;
+  gap: 28px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.board-wrap {
+  flex: 1 1 480px;
+  max-width: 560px;
+  min-width: 280px;
+}
+
+.sidebar {
+  flex: 1 1 260px;
+  max-width: 320px;
+  background: #2b2019;
+  border: 1px solid #4a3b2c;
+  border-radius: 10px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.status__turn { margin: 0 0 6px; }
+
+.status__flag {
+  display: inline-block;
+  margin: 0 6px 0 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.status__flag--warn { background: #6b2020; color: #ffd4d4; }
+.status__flag--thinking { background: #2a3f5f; color: #cfe0ff; }
+
+.status__note {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: #b8a98f;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.controls button {
+  background: #3a2c1f;
+  border: 1px solid #5c4a35;
+  color: #f5efe6;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 0.9rem;
+  transition: background 0.15s;
+}
+
+.controls button:not(:disabled):hover {
+  background: #4d3c2a;
+}
+
+.side-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: #d8cbb8;
+}
+
+.book-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.book-controls__status {
+  font-size: 0.8rem;
+  color: #9c8c74;
+}
+
+.move-log h2 {
+  font-size: 0.95rem;
+  margin: 0 0 8px;
+  color: #d8cbb8;
+}
+
+.move-log__text {
+  background: #1a130d;
+  border: 1px solid #3a2c1f;
+  border-radius: 6px;
+  padding: 10px;
+  font-size: 0.82rem;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  margin: 0;
+}
