@@ -1,9 +1,9 @@
 # Dyanis — chess engine
 
-Собственный шахматный движок на Go. Сначала разрабатывается и
-тестируется полностью локально (CLI, perft-тесты), позже
-компилируется в WebAssembly и подключается к React-фронтенду
-(без бэкенд-сервера — статичный деплой на GitHub Pages / Vercel).
+Собственный шахматный движок на Go. Разрабатывается и тестируется
+локально (CLI, perft-тесты), компилируется в WebAssembly и подключён
+к React-фронтенду (без бэкенд-сервера — статичный деплой на GitHub
+Pages / Vercel).
 
 ## Статус
 
@@ -17,10 +17,25 @@
 - [x] Шаг 4.5 — книга дебютов (Polyglot .bin): Zobrist-хеширование,
       чтение/декодирование `.bin`, взвешенный выбор хода, подключена
       к поиску как приоритетная проверка перед запуском negamax
-- [х] Шаг 5 — UCI-протокол (uci/isready/position/go/quit, книга подключена, SAN в -play)
-- [х] Шаг 6 — итеративное углубление и таймер
-- [ ] Шаг 7 — компиляция в WASM
-- [ ] Шаг 8 — React-доска и деплой
+- [x] Шаг 5 — UCI-протокол (uci/isready/position/go/quit, книга подключена, SAN в -play)
+- [x] Шаг 6 — итеративное углубление и таймер
+- [x] Шаг 7 — компиляция в WASM (`cmd/wasm`), JS-API `window.Dyanis`
+- [x] Шаг 8 — React-доска (`web/`): drag&drop + клик-клик
+      (`react-chessboard`), поиск ходов в отдельном Web Worker (не
+      блокирует страницу даже на большой глубине без лимита времени),
+      книга дебютов из браузера, выбор стороны/глубины/бюджета времени
+- [x] Шаг 9 — усиление поиска и оценки после первой рабочей версии:
+      - quiescence search (борьба с horizon effect — досматривает
+        взятия и шаховые серии за пределами номинальной глубины)
+      - move ordering: TT-ход → MVV-LVA → killer moves → history heuristic
+      - null-move pruning (с защитой от цугцванга и от отсечения в корне)
+      - оценочная функция расширена: mobility, пешечная структура
+        (сдвоенные/изолированные/проходные), king safety (пешечный щит
+        + открытые линии, taper по фазе), пара слонов, mop-up eval
+        (загон голого/слабого короля к краю в выигранных эндшпилях)
+- [ ] Шаг 10 — то, что осталось из классики: PVS/NegaScout, aspiration
+      windows, LMR, SEE, 50-move rule / threefold repetition detection
+      (сейчас не реализовано вообще — см. заметку в конце)
 
 ## Первым делом
 
@@ -29,6 +44,8 @@
 если планируешь публиковать репозиторий под своим именем.
 
 ## Как запустить
+
+### CLI (локальная разработка/отладка)
 
 ```bash
 # Все тесты (включая perft на стартовой позиции и Kiwipete)
@@ -63,10 +80,55 @@ go run ./cmd/cli -play -depth 4 -book assets/komodo.bin
 
 # Явно отключить книгу, даже если assets/gm2001.bin существует:
 go run ./cmd/cli -play -depth 4 -book ""
+
+# Как UCI-движок поверх stdin/stdout (Arena, CuteChess и т.п.)
+go run ./cmd/cli -uci
 ```
 
 По завершении партии (мат/пат) в `-play` печатается полный лог в
 стандартной нотации вида `1. e4 c5 2. Nf3 Nc6 3. ...`.
+
+### WASM-сборка (`cmd/wasm`)
+
+```powershell
+# PowerShell:
+$env:GOOS="js"; $env:GOARCH="wasm"; go build -o cmd/wasm/dyanis.wasm ./cmd/wasm
+```
+
+```bash
+# bash/zsh:
+GOOS=js GOARCH=wasm go build -o cmd/wasm/dyanis.wasm ./cmd/wasm
+```
+
+`wasm_exec.js` (копия из установки Go, обычно `$(go env GOROOT)/lib/wasm/wasm_exec.js`
+на Go ≥1.24 или `misc/wasm/wasm_exec.js` на более старых) уже лежит
+рядом в `cmd/wasm/`.
+
+Быстрая ручная проверка сборки (не финальный UI, просто smoke-test —
+подробности в `cmd/wasm/README.md`):
+
+```powershell
+py -m http.server 8000   # из корня репозитория, не из cmd/wasm
+```
+→ http://localhost:8000/cmd/wasm/
+
+### React-доска (`web/`)
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Перед первым запуском скопируй в `web/public/`:
+- `cmd/wasm/dyanis.wasm` и `cmd/wasm/wasm_exec.js` → в `web/public/wasm/`
+- `assets/gm2001.bin` (для кнопки "Загрузить книгу") → в `web/public/assets/`
+
+Поиск ходов работает в отдельном Web Worker (`web/public/engine-worker.js`)
+со своей независимой копией wasm-модуля — страница не подвисает,
+сколько бы движок ни думал, даже на большой глубине без ограничения
+по времени. Подробности архитектуры — в комментариях
+`web/src/engine/dyanisEngine.js`.
 
 ### Опционально: книга дебютов
 
@@ -82,36 +144,66 @@ Polyglot-совместимый `.bin` (например `gm2001.bin`, `komodo.b
 dyanis-chess-engine/
 ├── go.mod
 ├── cmd/
-│   └── cli/
-│       └── main.go            # локальный запуск: печать позиции, perft, -play (+ -book)
+│   ├── cli/
+│   │   └── main.go              # локальный запуск: печать позиции, perft, -play (+ -book), -uci
+│   └── wasm/
+│       ├── main.go              # JS-API window.Dyanis: newGame/makeMove/undo/getState/
+│       │                        #   engineMove/searchMove(стейтлесс, для воркера)/loadBook/...
+│       ├── index.html           # smoke-test страница (НЕ финальный UI, см. web/)
+│       ├── README.md            # как собрать и проверить wasm-сборку
+│       ├── wasm_exec.js         # копия из установки Go (глобальный класс Go)
+│       └── dyanis.wasm          # собранный бинарник — В GIT НЕ КОММИТИТСЯ, см. .gitignore
 ├── internal/
 │   ├── board/
-│   │   ├── board.go and board_test.go           # Piece, Square, Board, начальная расстановка
-│   │   ├── move.go            # Move, Board.MakeMove (рокировка/en passant/превращение)
-│   │   ├── fen.go             # парсинг и сериализация FEN
-│   │   ├── zobrist.go         # Board.Hash() — Polyglot-совместимый Zobrist-хеш
-│   │   └── zobrist_test.go
+│   │   ├── board.go, board_test.go      # Piece, Square, Board, начальная расстановка
+│   │   ├── move.go                      # Move, MakeMove (рокировка/en passant/превращение),
+│   │   │                                #   MakeNullMove (для search'а, см. ниже)
+│   │   ├── fen.go                       # парсинг и сериализация FEN
+│   │   ├── zobrist.go, zobrist_test.go  # Board.Hash() — Polyglot-совместимый Zobrist-хеш
 │   ├── movegen/
-│   │   ├── movegen.go         # генерация ходов + определение атакованных полей
-│   │   ├── status.go          # GameStatus (мат/пат/продолжается), InCheck
-│   │   ├── notation.go        # SAN: рендер и разбор ходов (Nf3, exd5, O-O, e8=Q#), GameLog
+│   │   ├── movegen.go           # генерация ходов + определение атакованных полей
+│   │   ├── status.go            # GameStatus (мат/пат/продолжается), InCheck
+│   │   ├── notation.go          # SAN: рендер и разбор ходов (Nf3, exd5, O-O, e8=Q#), GameLog
 │   │   └── *_test.go
 │   ├── perft/
-│   │   ├── perft.go           # Perft(), Divide()
-│   │   └── perft_test.go      # эталонные числа: старт + Kiwipete
+│   │   ├── perft.go             # Perft(), Divide()
+│   │   └── perft_test.go        # эталонные числа: старт + Kiwipete
 │   ├── search/
-│   │   ├── search.go          # BestMove(): негамакс + alpha-beta, фиксир. глубина
-│   │   ├── opening_book.go    # BestMoveWithBook(): книга — приоритет перед поиском
-│   │   └── *_test.go
+│   │   ├── search.go            # negamax + alpha-beta + TT + quiescence + null-move pruning
+│   │   │                        #   + move ordering (TT-ход/MVV-LVA/killers/history)
+│   │   ├── opening_book.go      # BestMoveWithBook(): книга — приоритет перед поиском
+│   │   ├── search_test.go, tt_test.go
 │   ├── eval/
-│   │   └── eval.go            # материал + piece-square tables
+│   │   ├── eval.go              # материал + вызов всех остальных слагаемых, gamePhase
+│   │   ├── pst.go               # piece-square таблицы (Michniewski), taper короля по фазе
+│   │   ├── mobility.go          # подвижность фигур (безопасные клетки хода)
+│   │   ├── pawns.go             # сдвоенные/изолированные/проходные пешки
+│   │   ├── king_safety.go       # пешечный щит + открытые линии рядом с королём
+│   │   ├── bishops.go           # бонус за пару слонов
+│   │   ├── mopup.go             # "загони голого короля к краю" в выигранных эндшпилях
+│   │   └── *_test.go
 │   ├── book/
-│   │   └── book.go            # чтение/декодирование Polyglot .bin, взвешенный выбор
+│   │   └── book.go              # Load (с диска) / Parse (из байт, для браузера) Polyglot .bin
 │   └── uci/
-│       ├──uci_test.go
-│       └── uci.go             # [шаг 5] UCI-протокол — заглушка
-├── assets/                     # book.bin'ы кладутся сюда (например gm2001.bin, komodo.bin)
-└── wasm/                       # появится на шаге 7 (cmd/wasm/main.go + wasm_exec.js)
+│       ├── uci.go               # UCI-протокол: uci/isready/position/go/quit
+│       └── uci_test.go
+├── assets/                      # book.bin'ы (gm2001.bin, komodo.bin, ...)
+└── web/                         # React-доска (шаг 8)
+    ├── package.json, vite.config.js, index.html
+    ├── public/
+    │   ├── wasm/                # dyanis.wasm + wasm_exec.js — копируются сюда вручную
+    │   ├── assets/               # gm2001.bin — копируется сюда вручную
+    │   └── engine-worker.js     # отдельный Web Worker: своя копия wasm, только для поиска
+    └── src/
+        ├── main.jsx, App.jsx, App.css, index.css
+        ├── engine/
+        │   └── dyanisEngine.js  # обёртка: sync API основного потока (бухгалтерия партии) +
+        │                        #   async API воркера (сам поиск, никогда не блокирует страницу)
+        ├── hooks/
+        │   └── useElementWidth.js
+        └── components/
+            ├── Board.jsx        # react-chessboard: drag&drop + клик-клик
+            └── MoveLog.jsx
 ```
 
 ## Архитектурные заметки
@@ -131,8 +223,47 @@ dyanis-chess-engine/
   глубоко в дереве поиска — это решение уровня "какой ход играть
   прямо сейчас", поэтому оно живёт как проверка в самом начале
   `search.BestMoveWithBook`, а не как слагаемое в `eval.Evaluate`.
-- **`Board.Hash()` сейчас считается заново с нуля** при каждом вызове
-  (обход всех 64 клеток). Это нормально для редких обращений к книге,
-  но станет узким местом, когда хеш понадобится на каждой ноде поиска
-  для транспозиционной таблицы (шаг 6) — тогда его стоит сделать
-  инкрементальным полем `Board`, обновляемым в `MakeMove`.
+- **`Board.Hash()` считается заново с нуля** при каждом вызове (обход
+  всех 64 клеток). Нормально для текущих глубин; стоит сделать
+  инкрементальным полем `Board`, обновляемым в `MakeMove`, если
+  профилирование когда-нибудь покажет, что это узкое место.
+- **Quiescence search** (`search.go`, `quiescence`/`quiescenceSearch`)
+  досматривает взятия (и, с ограниченным бюджетом, шаховые серии) за
+  пределами номинальной глубины — без этого негамакс на границе
+  глубины может остановиться прямо посреди размена и посчитать
+  "выиграл пешку", хотя следующим ходом фигуру отбивают обратно.
+- **Move ordering** (там же) — TT-ход, затем взятия по MVV-LVA
+  (Most Valuable Victim, Least Valuable Attacker), затем killer moves
+  (тихие ходы, давшие отсечение на этой же глубине в соседней
+  позиции), затем всё остальное по history heuristic. От этого впрямую
+  зависит эффективность alpha-beta отсечений.
+- **Null-move pruning** — "а что если пропустить ход, всё равно ли
+  сопернику плохо?" с защитой от цугцванга (`hasNonPawnMaterial`) и от
+  срабатывания прямо в корне дерева (параметр `isRoot` у `negamax`,
+  иначе `BestMove` не получит вычисленный лучший ход).
+- **Mop-up eval** (`eval/mopup.go`) — в выигранных эндшпилях (перевес
+  ≥ ~500cp) остальные слагаемые eval быстро насыщаются и перестают
+  различать ходы, из-за чего движок может бесконечно "шаркать"
+  фигурами вместо того, чтобы доводить мат. Этот термин создаёт явный
+  градиент: гони слабого короля к краю, приближай своего короля ему
+  на помощь.
+- **50-move rule и троекратное повторение НЕ реализованы вообще**
+  (см. комментарий в `movegen/status.go`) — движок не объявит ничью
+  сам и ничего не штрафует за повтор позиции в поиске. На практике это
+  означает, что даже с mop-up eval движок может теоретически зациклиться
+  в редких вырожденных позициях, если несколько разных ходов дают
+  ровно одинаковый счёт. Полноценное решение — отслеживать историю
+  позиций (Zobrist-хеши сыгранной партии) и либо форсировать ничью по
+  правилам, либо хотя бы штрафовать повтор в поиске.
+- **wasm использует ДВА независимых экземпляра модуля** — один в
+  основном потоке страницы (быстрая бухгалтерия партии: ходы, история,
+  undo, никогда не блокирует), второй в отдельном Web Worker (только
+  поиск, полностью изолирован по памяти от первого). Именно поэтому у
+  `window.Dyanis` есть стейтлесс-функция `searchMove(fen, depth,
+  movetimeMs)` отдельно от завязанного на внутреннее состояние партии
+  `engineMove()` — воркеру неоткуда взять текущую позицию иначе, кроме
+  как явным параметром. Решённый ход воркер только *предлагает*;
+  применяет его к реальному состоянию партии всегда основной поток,
+  тем же вызовом `makeMove`, что и для хода человека.
+- **`dyanis.wasm` не коммитится в git** — это собранный артефакт,
+  пересобирается из `cmd/wasm/main.go` командой выше. См. `.gitignore`.
