@@ -181,3 +181,73 @@ func DecodeMove(e Entry, legal []board.Move) (board.Move, bool) {
 func New(entries []Entry) *Book {
 	return &Book{entries: entries}
 }
+
+// Source is whatever a caller looks moves up in: a single Book or a
+// Chain of them. search.BestMoveWithBook (and any other consumer)
+// should take a Source rather than a concrete *Book, so that passing
+// a Chain instead of a single book — or swapping one for the other
+// later — needs no change at the call site.
+type Source interface {
+	LookupBoard(pos *board.Board) []Entry
+}
+
+// Chain is an ordered list of books tried in priority order: the
+// first book that has any entry for a position "wins" and its
+// entries are returned as-is (with its own weights); books further
+// down the chain are not consulted for that position.
+//
+// This is deliberately NOT a merge of entries across books. Weight is
+// a relative frequency *within* a single book, not a normalized
+// probability — mixing entries from two different books and picking
+// by raw Weight would silently favor whichever book happens to use
+// larger numbers, with no chess-relevant meaning behind it. A
+// priority-ordered chain (e.g. "prefer gm2001.bin's take on the
+// position; only fall back to komodo.bin if gm2001 has never seen
+// it") is both simpler and avoids that trap.
+type Chain struct {
+	books []*Book
+}
+
+// NewChain builds a Chain from books in priority order: books[0] is
+// consulted first, books[1] only if books[0] has no entries for the
+// position, and so on. Nil books are skipped (so callers can pass the
+// result of a Load that failed/was optional without checking first).
+func NewChain(books ...*Book) *Chain {
+	c := &Chain{books: make([]*Book, 0, len(books))}
+	for _, b := range books {
+		if b != nil {
+			c.books = append(c.books, b)
+		}
+	}
+	return c
+}
+
+// Lookup returns entries from the first book in the chain that has
+// any for this Zobrist hash, or nil if none of them do.
+func (c *Chain) Lookup(zobristKey uint64) []Entry {
+	for _, b := range c.books {
+		if found := b.Lookup(zobristKey); len(found) > 0 {
+			return found
+		}
+	}
+	return nil
+}
+
+// LookupBoard returns entries from the first book in the chain that
+// has any for this position, or nil if none of them do.
+func (c *Chain) LookupBoard(pos *board.Board) []Entry {
+	return c.Lookup(pos.Hash())
+}
+
+// Len reports the total number of loaded entries across every book in
+// the chain (informational only — e.g. for a "book loaded: N books, M
+// entries total" log line; not meaningful for lookup behavior since
+// later books' entries may never be consulted for positions the first
+// book already covers).
+func (c *Chain) Len() int {
+	total := 0
+	for _, b := range c.books {
+		total += b.Len()
+	}
+	return total
+}

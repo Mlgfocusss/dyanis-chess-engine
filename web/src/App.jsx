@@ -181,6 +181,12 @@ export default function App() {
             {state.inCheck && state.status === "ongoing" && <p className="status__flag status__flag--warn">Шах</p>}
             {state.status === "checkmate" && <p className="status__flag status__flag--warn">Мат</p>}
             {state.status === "stalemate" && <p className="status__flag status__flag--warn">Пат — ничья</p>}
+            {state.status === "draw-fifty-move" && (
+              <p className="status__flag status__flag--warn">Ничья по правилу 50 ходов</p>
+            )}
+            {state.status === "draw-repetition" && (
+              <p className="status__flag status__flag--warn">Ничья — троекратное повторение позиции</p>
+            )}
             {thinking && <p className="status__flag status__flag--thinking">движок думает… (страница не зависает)</p>}
             {engineNote && <p className="status__note">{engineNote}</p>}
           </div>

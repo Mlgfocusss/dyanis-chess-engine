@@ -174,6 +174,20 @@ type Board struct {
 
 	HalfmoveClock  int // for the 50-move rule
 	FullmoveNumber int
+
+	// hash is the Polyglot-compatible Zobrist hash of this exact
+	// position (see zobrist.go's Hash method). Kept as a plain stored
+	// field, maintained INCREMENTALLY by MakeMove/MakeNullMove (XORed
+	// in/out per changed square, castling right, en passant file, and
+	// side to move) rather than recomputed from scratch on every call
+	// — see zobrist.go's package comment for why that recomputation
+	// was fine for occasional book lookups but too slow once this
+	// became the transposition table's lookup key, called on every
+	// search node. Every code path that builds a Board from nothing
+	// (NewInitialBoard, FromFEN) computes this once via
+	// computeHashFromScratch; Copy() carries it along automatically
+	// since it's a plain uint64 field, not a pointer or slice.
+	hash uint64
 }
 
 // NewInitialBoard returns the standard starting position.
@@ -193,6 +207,7 @@ func NewInitialBoard() *Board {
 		b.Squares[MakeSquare(file, 6)] = MakePiece(Pawn, Black)
 		b.Squares[MakeSquare(file, 7)] = MakePiece(backRank[file], Black)
 	}
+	b.hash = b.computeHashFromScratch()
 	return b
 }
 

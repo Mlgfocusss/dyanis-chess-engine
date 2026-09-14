@@ -82,7 +82,7 @@ func TestKillerRecordedOnBetaCutoff(t *testing.T) {
 	// of roughly-equal quiet moves for alpha-beta to prune between).
 	b := board.NewInitialBoard()
 	tt := NewTranspositionTable()
-	negamax(b, 3, -Infinity, Infinity, true, tt)
+	negamax(b, 3, 0, -Infinity, Infinity, true, tt)
 
 	found := false
 	for _, slots := range tt.killers {

@@ -103,6 +103,8 @@ func FromFEN(fen string) (*Board, error) {
 		}
 	}
 
+	b.hash = b.computeHashFromScratch()
+
 	return b, nil
 }
 

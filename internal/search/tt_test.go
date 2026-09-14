@@ -98,7 +98,7 @@ func TestNegamaxNilTableStillWorks(t *testing.T) {
 	// a standalone top-level call, not one made from within another
 	// negamax's move loop.
 	b := board.NewInitialBoard()
-	score, m := negamax(b, 2, -Infinity, Infinity, true, nil)
+	score, m := negamax(b, 2, 0, -Infinity, Infinity, true, nil)
 	if m.String() == "" {
 		t.Error("expected a real move from negamax with tt == nil")
 	}

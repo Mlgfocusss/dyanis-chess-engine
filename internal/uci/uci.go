@@ -49,17 +49,33 @@ const (
 type session struct {
 	pos   *board.Board
 	depth int
-	book  *book.Book
+	book  book.Source
 	w     *bufio.Writer
+
+	// history holds the Zobrist hash of every position in the current
+	// game, in order, INCLUDING pos itself — needed by
+	// GameStatusWithHistory's threefold-repetition check (see
+	// handleGo). Unlike cmd/cli and cmd/wasm, this is NOT built up
+	// incrementally move by move: a UCI GUI resends the position from
+	// scratch on every "position" command (startpos/fen plus the FULL
+	// move list since then, not just new moves — see handlePosition),
+	// so history is simplest rebuilt from scratch alongside pos every
+	// time, rather than trying to diff against whatever the previous
+	// "position" command left behind.
+	history []uint64
 }
 
 // Loop reads UCI commands from r, one per line, and writes responses
 // to w, until "quit" is received or r hits EOF/an error. depth is the
 // fixed search depth used for "go" (and "go depth N" without a valid
-// N); bk may be nil to play without an opening book. Loop starts from
-// the standard starting position; "position" changes that.
-func Loop(r *bufio.Reader, w *bufio.Writer, depth int, bk *book.Book) {
-	s := &session{pos: board.NewInitialBoard(), depth: depth, book: bk, w: w}
+// N); bk may be nil to play without an opening book (a *book.Book or
+// a *book.Chain both satisfy book.Source — see internal/book/book.go
+// — so a GUI-configured multi-book chain works here exactly as it
+// does in the CLI and wasm builds). Loop starts from the standard
+// starting position; "position" changes that.
+func Loop(r *bufio.Reader, w *bufio.Writer, depth int, bk book.Source) {
+	start := board.NewInitialBoard()
+	s := &session{pos: start, depth: depth, book: bk, w: w, history: []uint64{start.Hash()}}
 
 	for {
 		line, readErr := r.ReadString('\n')
@@ -93,7 +109,9 @@ func (s *session) handle(line string) bool {
 		s.w.Flush()
 
 	case "ucinewgame":
-		s.pos = board.NewInitialBoard()
+		start := board.NewInitialBoard()
+		s.pos = start
+		s.history = []uint64{start.Hash()}
 
 	case "position":
 		s.handlePosition(fields[1:])
@@ -148,6 +166,11 @@ func (s *session) handlePosition(args []string) {
 		return
 	}
 
+	// history is rebuilt from scratch alongside pos (see session's doc
+	// comment on the field) — starts with this position's own hash,
+	// then gains one more entry per move successfully applied below.
+	history := []uint64{pos.Hash()}
+
 	if i < len(args) && args[i] == "moves" {
 		for _, token := range args[i+1:] {
 			m, ok := findMoveByCoordinates(pos, token)
@@ -155,10 +178,12 @@ func (s *session) handlePosition(args []string) {
 				return // stop applying at the first move that doesn't match
 			}
 			pos = pos.MakeMove(m)
+			history = append(history, pos.Hash())
 		}
 	}
 
 	s.pos = pos
+	s.history = history
 }
 
 func findMoveByCoordinates(pos *board.Board, token string) (board.Move, bool) {
@@ -205,6 +230,19 @@ func (s *session) handleGo(args []string) {
 				i++
 			}
 		}
+	}
+
+	// Informational only: UCI leaves the actual draw ruling to the
+	// GUI/arbiter, not the engine, so this never withholds bestmove —
+	// search still runs and a legal move (if any) still gets sent
+	// below. This just surfaces what GameStatusWithHistory already
+	// knows, the same awareness cmd/cli and cmd/wasm act on directly,
+	// so a GUI operator watching engine output isn't left wondering
+	// why the engine keeps happily shuffling in a position that's
+	// actually already drawn.
+	if status := movegen.GameStatusWithHistory(s.pos, s.history); status.IsDraw() {
+		fmt.Fprintf(s.w, "info string %s\n", status)
+		s.w.Flush()
 	}
 
 	var m board.Move

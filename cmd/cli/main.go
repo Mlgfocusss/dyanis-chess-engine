@@ -33,7 +33,7 @@ func main() {
 	uciMode := flag.Bool("uci", false, "run as a UCI engine over stdin/stdout, for GUIs like Arena or CuteChess, instead of the local CLI")
 	depth := flag.Int("depth", 3, "search depth in plies for -play/-uci. Fixed depth by default; if -movetime is also set, this becomes the max depth ceiling for iterative deepening instead")
 	movetime := flag.Int("movetime", 0, "time budget in milliseconds for -play's engine moves; 0 (default) means fixed-depth search instead of iterative deepening with a timer")
-	bookPath := flag.String("book", "assets/gm2001.bin", "path to a Polyglot .bin opening book; while the position stays in the book, -play plays from it instead of searching. Pass -book=\"\" to disable. If the file can't be loaded, this only prints a warning and plays without a book — it's never a hard failure, since the default shouldn't break -play on a fresh checkout that hasn't downloaded any .bin yet")
+	bookPath := flag.String("book", "assets/gm2001.bin", "comma-separated list of Polyglot .bin opening books, in priority order: while the position is found in the first book, -play/-uci plays from it; only checks the second book if the first has no entry for that position, and so on (see book.Chain). E.g. -book=\"assets/gm2001.bin,assets/komodo.bin,assets/performance.bin\". Pass -book=\"\" to disable. A book that fails to load only prints a warning and is skipped — never a hard failure, so the default doesn't break -play on a fresh checkout that hasn't downloaded any .bin yet")
 	flag.Parse()
 
 	b, err := board.FromFEN(*fen)
@@ -42,13 +42,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	var bk *book.Book
-	if *bookPath != "" {
-		bk, err = book.Load(*bookPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not load book %q: %v — playing without an opening book\n", *bookPath, err)
-			bk = nil
-		}
+	bk := loadBookChain(*bookPath, os.Stderr)
+	if bk == nil && *bookPath != "" {
+		fmt.Fprintf(os.Stderr, "note: playing without an opening book (none of %q loaded)\n", *bookPath)
 	}
 
 	w := bufio.NewWriter(os.Stdout)
@@ -79,6 +75,44 @@ func main() {
 	}
 }
 
+// loadBookChain parses the -book flag's comma-separated list of
+// paths and loads each one, in order, into a book.Source suitable for
+// search.BestMoveWithBook: nil if the list is empty (-book="",
+// opening book disabled) or every path failed to load; the lone
+// *book.Book directly if exactly one loaded (no point wrapping a
+// single book in a Chain); a *book.Chain, tried in list order, if
+// two or more loaded.
+//
+// A path that fails to load (missing file, corrupt data, ...) only
+// prints a warning to warnOut and is skipped — same "never a hard
+// failure" behavior the original single-book version had, just
+// per-path now instead of all-or-nothing: e.g. a typo'd komodo.bin
+// shouldn't also cost you a perfectly good gm2001.bin.
+func loadBookChain(bookFlag string, warnOut *os.File) book.Source {
+	var books []*book.Book
+	for _, path := range strings.Split(bookFlag, ",") {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue // handles both -book="" and stray ",," typos
+		}
+		bk, err := book.Load(path)
+		if err != nil {
+			fmt.Fprintf(warnOut, "warning: could not load book %q: %v — skipping\n", path, err)
+			continue
+		}
+		books = append(books, bk)
+	}
+
+	switch len(books) {
+	case 0:
+		return nil // literal nil book.Source: no book loaded, play from search only
+	case 1:
+		return books[0]
+	default:
+		return book.NewChain(books...)
+	}
+}
+
 // playInteractive runs a text-based game loop: type moves in SAN
 // ("e4", "Nf3", "O-O", "exd5", "e8=Q#" — coordinate notation like
 // "e2e4" also still works) and the engine replies. If bk is non-nil
@@ -92,9 +126,18 @@ func main() {
 // ceiling for that search rather than a fixed depth) via
 // search.BestMoveTimedWithBook; otherwise it's a fixed-depth search via
 // search.BestMoveWithBook, as before.
-func playInteractive(b *board.Board, w *bufio.Writer, depth, movetimeMs int, bk *book.Book) {
+func playInteractive(b *board.Board, w *bufio.Writer, depth, movetimeMs int, bk book.Source) {
 	reader := bufio.NewReader(os.Stdin)
 	var sanMoves []string
+
+	// history holds the Zobrist hash of every position reached in this
+	// game so far, INCLUDING the current one (b.Hash() below covers
+	// the starting position; each MakeMove call further down appends
+	// the resulting position's hash right after playing it). This is
+	// exactly what GameStatusWithHistory needs to detect threefold
+	// repetition — see movegen/status.go's doc comment on that
+	// function for the exact contract.
+	history := []uint64{b.Hash()}
 
 	printLog := func() {
 		if len(sanMoves) > 0 {
@@ -107,15 +150,22 @@ func playInteractive(b *board.Board, w *bufio.Writer, depth, movetimeMs int, bk 
 		fmt.Fprintf(w, "side to move: %s\n", b.SideToMove)
 		w.Flush()
 
-		status := movegen.GameStatus(b)
-		if status == movegen.Checkmate {
+		switch movegen.GameStatusWithHistory(b, history) {
+		case movegen.Checkmate:
 			winner := b.SideToMove.Opposite()
 			fmt.Fprintf(w, "Checkmate. %s wins.\n", winner)
 			printLog()
 			return
-		}
-		if status == movegen.Stalemate {
+		case movegen.Stalemate:
 			fmt.Fprintf(w, "Stalemate. Draw.\n")
+			printLog()
+			return
+		case movegen.DrawFiftyMove:
+			fmt.Fprintf(w, "Draw by the 50-move rule.\n")
+			printLog()
+			return
+		case movegen.DrawRepetition:
+			fmt.Fprintf(w, "Draw by threefold repetition.\n")
 			printLog()
 			return
 		}
@@ -168,6 +218,7 @@ func playInteractive(b *board.Board, w *bufio.Writer, depth, movetimeMs int, bk 
 		}
 
 		b = b.MakeMove(m)
+		history = append(history, b.Hash())
 	}
 }
 

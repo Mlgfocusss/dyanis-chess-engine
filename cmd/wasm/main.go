@@ -45,8 +45,32 @@ var game = struct {
 	pos      *board.Board
 	history  []*board.Board // history[0] is the starting position; used for undo
 	sanMoves []string
-	bk       *book.Book // nil until Dyanis.loadBook(bytes) is called
+
+	// books holds every book loaded so far, in the order loadBook was
+	// called — first loaded = highest priority (matches CLI's -book
+	// flag order). bk is the resulting book.Source handed to search:
+	// nil while books is empty, a lone *book.Book after one load (no
+	// point wrapping a single book in a Chain), or a *book.Chain once
+	// there are two or more. Rebuilt by rebuildBookSource after every
+	// loadBook/clearBook call rather than computed on the fly, so
+	// engineMove/searchMove never pay chain-construction cost per move.
+	books []*book.Book
+	bk    book.Source
 }{}
+
+// rebuildBookSource recomputes game.bk from game.books. Called after
+// every change to game.books (load or clear) so game.bk is always
+// ready to hand straight to search.BestMoveWithBook.
+func rebuildBookSource() {
+	switch len(game.books) {
+	case 0:
+		game.bk = nil // literal nil book.Source — see opening_book.go's caller-beware note
+	case 1:
+		game.bk = game.books[0]
+	default:
+		game.bk = book.NewChain(game.books...)
+	}
+}
 
 func resetGame(startFEN string) error {
 	var b *board.Board
@@ -124,15 +148,34 @@ type moveResponse struct {
 	State    stateResponse `json:"state"`
 }
 
+// historyHashes maps game.history (kept as full boards, for undo) to
+// the Zobrist hashes GameStatusWithHistory needs for repetition
+// detection. Recomputed on every buildState call rather than cached
+// alongside game.history — same "just recompute Hash() from scratch"
+// tradeoff Board.Hash() itself already makes (see its doc comment):
+// fine at the game lengths a casual browser game reaches, worth
+// caching per-position if it ever shows up in profiling.
+func historyHashes() []uint64 {
+	hashes := make([]uint64, len(game.history))
+	for i, pos := range game.history {
+		hashes[i] = pos.Hash()
+	}
+	return hashes
+}
+
 func buildState() stateResponse {
 	b := game.pos
 
 	status := "ongoing"
-	switch movegen.GameStatus(b) {
+	switch movegen.GameStatusWithHistory(b, historyHashes()) {
 	case movegen.Checkmate:
 		status = "checkmate"
 	case movegen.Stalemate:
 		status = "stalemate"
+	case movegen.DrawFiftyMove:
+		status = "draw-fifty-move"
+	case movegen.DrawRepetition:
+		status = "draw-repetition"
 	}
 
 	legal := movegen.GenerateLegalMoves(b)
@@ -284,16 +327,33 @@ func jsPerft(this js.Value, args []js.Value) any {
 	return toJSON(map[string]any{"depth": depth, "nodes": total})
 }
 
-// Dyanis.loadBook(bytes) -> {"ok":true,"entries":N} or {"ok":false,"error":...}.
-// bytes must be a Uint8Array holding the raw contents of a Polyglot
-// .bin file — there's no filesystem in the browser, so JS has to
-// fetch() the file itself and hand the bytes over, e.g.:
+// Dyanis.loadBook(bytes) -> {"ok":true,"entries":N,"books":N} or
+// {"ok":false,"error":...}. bytes must be a Uint8Array holding the
+// raw contents of a Polyglot .bin file — there's no filesystem in the
+// browser, so JS has to fetch() the file itself and hand the bytes
+// over, e.g.:
 //
 //	const buf = await (await fetch("assets/gm2001.bin")).arrayBuffer();
 //	log(Dyanis.loadBook(new Uint8Array(buf)));
 //
-// Once loaded, engineMove automatically checks the book first, same
-// as -play/-uci in the CLI — no separate "use book" flag needed.
+// Calling this more than once does NOT replace the previous book —
+// it APPENDS to a priority chain (see book.Chain in internal/book):
+// the first book loaded is consulted first for any given position;
+// later ones are only consulted if earlier ones have no entry for it.
+// So to get "try gm2001.bin, then komodo.bin, then performance.bin":
+//
+//	for (const name of ["gm2001.bin", "komodo.bin", "performance.bin"]) {
+//	  const buf = await (await fetch(`assets/${name}`)).arrayBuffer();
+//	  Dyanis.loadBook(new Uint8Array(buf));
+//	}
+//
+// Call Dyanis.clearBook() first if you want to replace the chain
+// instead of extending it (e.g. the user picked a different book set
+// in the UI). "entries" in the response is this call's book alone;
+// "books" is the running count of books now in the chain.
+//
+// Once loaded, engineMove automatically checks the book(s) first,
+// same as -play/-uci in the CLI — no separate "use book" flag needed.
 func jsLoadBook(this js.Value, args []js.Value) any {
 	if len(args) < 1 {
 		return toJSON(map[string]any{"ok": false, "error": "loadBook expects a Uint8Array of .bin file contents"})
@@ -306,25 +366,35 @@ func jsLoadBook(this js.Value, args []js.Value) any {
 	if err != nil {
 		return toJSON(map[string]any{"ok": false, "error": err.Error()})
 	}
-	game.bk = bk
-	return toJSON(map[string]any{"ok": true, "entries": bk.Len()})
+	game.books = append(game.books, bk)
+	rebuildBookSource()
+	return toJSON(map[string]any{"ok": true, "entries": bk.Len(), "books": len(game.books)})
 }
 
-// Dyanis.clearBook() -> {"ok":true}. Goes back to pure search, same
-// as -book="" in the CLI.
+// Dyanis.clearBook() -> {"ok":true}. Drops the entire chain and goes
+// back to pure search, same as -book="" in the CLI. Call this before
+// loadBook if you want to replace the chain rather than extend it.
 func jsClearBook(this js.Value, args []js.Value) any {
-	game.bk = nil
+	game.books = nil
+	rebuildBookSource()
 	return toJSON(map[string]any{"ok": true})
 }
 
-// Dyanis.bookInfo() -> {"loaded":bool,"entries":N}. Lets the frontend
-// show book status (e.g. a badge) without having to track it itself
-// across page reloads/re-renders.
+// Dyanis.bookInfo() -> {"loaded":bool,"books":N,"entries":N}.
+// "entries" sums every book in the chain — informational only, since
+// a position covered by book 1 never actually reaches book 2's
+// entries (see book.Chain.Len's doc). Lets the frontend show book
+// status (e.g. a badge) without having to track it itself across page
+// reloads/re-renders.
 func jsBookInfo(this js.Value, args []js.Value) any {
-	if game.bk == nil {
-		return toJSON(map[string]any{"loaded": false, "entries": 0})
+	if len(game.books) == 0 {
+		return toJSON(map[string]any{"loaded": false, "books": 0, "entries": 0})
 	}
-	return toJSON(map[string]any{"loaded": true, "entries": game.bk.Len()})
+	total := 0
+	for _, b := range game.books {
+		total += b.Len()
+	}
+	return toJSON(map[string]any{"loaded": true, "books": len(game.books), "entries": total})
 }
 
 // Dyanis.searchMove(fen, depth?, movetimeMs?) -> like engineMove's

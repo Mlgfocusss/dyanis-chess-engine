@@ -30,10 +30,26 @@ import (
 // here, before search ever runs, exactly as book.go's original TODO
 // called for.
 //
+// bk is a book.Source — either a single *book.Book or a *book.Chain
+// of several tried in priority order (see book.go). Taking the
+// interface rather than *book.Book means a caller can pass either
+// without this function caring which.
+//
 // bk may be nil (no book loaded), in which case this is identical to
 // calling BestMove directly. The bool return reports whether the move
 // came from the book, purely so callers (e.g. the CLI) can say so.
-func BestMoveWithBook(b *board.Board, depth int, bk *book.Book) (m board.Move, fromBook bool, err error) {
+//
+// Caller beware: the "no book" state must reach here as a literal nil
+// book.Source (e.g. a struct field declared as book.Source, left at
+// its zero value). If a caller instead holds a `var b *book.Book`
+// that is nil and passes it here, Go boxes that nil *book.Book into a
+// NON-nil book.Source (the interface value has a type but a nil
+// pointer inside it) — `bk != nil` below would then be true, and the
+// call would panic on a nil pointer dereference the first time
+// LookupBoard runs. Keep book state typed as book.Source (or Chain)
+// throughout — game.bk in cmd/wasm and the CLI's book variable both
+// do this — and this can't happen.
+func BestMoveWithBook(b *board.Board, depth int, bk book.Source) (m board.Move, fromBook bool, err error) {
 	if bk != nil {
 		if bm, ok := pickBookMove(b, bk); ok {
 			return bm, true, nil
@@ -48,7 +64,7 @@ func BestMoveWithBook(b *board.Board, depth int, bk *book.Book) (m board.Move, f
 // its comment for why the book is checked here rather than folded
 // into eval. maxDepth/budget are passed straight through to
 // BestMoveTimed when there's no book hit.
-func BestMoveTimedWithBook(b *board.Board, maxDepth int, budget time.Duration, bk *book.Book) (m board.Move, fromBook bool, err error) {
+func BestMoveTimedWithBook(b *board.Board, maxDepth int, budget time.Duration, bk book.Source) (m board.Move, fromBook bool, err error) {
 	if bk != nil {
 		if bm, ok := pickBookMove(b, bk); ok {
 			return bm, true, nil
@@ -65,7 +81,7 @@ func BestMoveTimedWithBook(b *board.Board, maxDepth int, budget time.Duration, b
 // played in 3, but the engine won't always play the single most
 // popular try — always doing that would make it perfectly predictable
 // and throw away the variety the weights are meant to encode.
-func pickBookMove(b *board.Board, bk *book.Book) (board.Move, bool) {
+func pickBookMove(b *board.Board, bk book.Source) (board.Move, bool) {
 	entries := bk.LookupBoard(b)
 	if len(entries) == 0 {
 		return board.Move{}, false

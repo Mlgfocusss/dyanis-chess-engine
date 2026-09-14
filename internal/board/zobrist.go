@@ -4,20 +4,20 @@
 // starting position hashes to 0x463b96181691fc9c under both.
 //
 // This exists for two reasons: internal/book needs it to look up
-// positions in .bin opening books (step 4.5), and the search package
-// will want it later for a transposition table (step 6). Both can
-// share this one implementation since Polyglot's scheme is a
-// perfectly good general-purpose Zobrist hash, not something
+// positions in .bin opening books (step 4.5), and search's
+// transposition table needs it as a lookup key on every node (step
+// 6+). Both share this one implementation since Polyglot's scheme is
+// a perfectly good general-purpose Zobrist hash, not something
 // book-specific.
 //
-// Board.Hash computes the hash from scratch by walking the whole
-// board. That's O(64) per call, which is fine for book lookups (a
-// handful of calls per game, only in the opening) but would be too
-// slow to call on every node once it's used for the search's
-// transposition table — at that point this should become an
-// incrementally-updated field on Board, XORed in/out per MakeMove
-// instead of recomputed. Deferred until step 6 needs it, per the
-// project's "optimize once it's the actual bottleneck" approach.
+// Board.Hash is a field read, not a computation: the hash is
+// maintained incrementally by MakeMove/MakeNullMove (see move.go),
+// XORed in/out per changed square, castling right, en passant file,
+// and side to move, rather than recomputed by walking the whole board
+// on every call. computeHashFromScratch (the O(64) full walk this
+// used to be) still exists, but only as the one-time seed for a Board
+// built from nothing (NewInitialBoard, FromFEN) and as a correctness
+// check (VerifyHash) — never on the hot path anymore.
 package board
 
 // polyglotRandom64 is the fixed table of 781 pseudo-random 64-bit
@@ -249,8 +249,24 @@ func pieceIndex(p Piece) int {
 	return (int(p.Type())-1)*2 + pivot
 }
 
-// Hash computes the Polyglot-compatible Zobrist hash of the position.
+// Hash returns the Polyglot-compatible Zobrist hash of the position.
+// This is just a field read — see the Board.hash field's own comment
+// for why: MakeMove/MakeNullMove keep it correct incrementally, so
+// there's no per-call recomputation cost even though this gets called
+// on every search node (transposition table lookups) as well as the
+// occasional book lookup it was originally written for.
 func (b *Board) Hash() uint64 {
+	return b.hash
+}
+
+// computeHashFromScratch walks the entire board and recomputes the
+// Zobrist hash from nothing, the way Hash used to work before it
+// became an incrementally-maintained field. Only two callers should
+// ever need this: NewInitialBoard/FromFEN, to seed b.hash the one
+// time a Board is built from nothing rather than derived from another
+// Board via MakeMove/MakeNullMove/Copy; and VerifyHash below, as a
+// correctness check for exactly that incremental maintenance.
+func (b *Board) computeHashFromScratch() uint64 {
 	var h uint64
 
 	for sq, p := range b.Squares {
@@ -282,6 +298,18 @@ func (b *Board) Hash() uint64 {
 	}
 
 	return h
+}
+
+// VerifyHash reports whether b's incrementally-maintained hash field
+// matches a full from-scratch recomputation. Only meaningful as a
+// correctness check — e.g. walked over every position in a perft
+// traversal — never needed in normal play, since MakeMove/
+// MakeNullMove are responsible for keeping b.hash correct on every
+// call and this is just double-checking that they did. A mismatch
+// here means an incremental-update bug (a missed XOR somewhere in
+// move.go), not anything wrong with the position itself.
+func (b *Board) VerifyHash() bool {
+	return b.hash == b.computeHashFromScratch()
 }
 
 // enPassantCaptureIsPossible reports whether a pawn belonging to the

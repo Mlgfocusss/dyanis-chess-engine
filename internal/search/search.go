@@ -28,11 +28,64 @@ const Infinity = 1_000_000
 // material gain, but still comfortably below Infinity so alpha-beta
 // bounds don't collide with it.
 //
-// Caveat: this version doesn't do mate-distance adjustment (preferring
-// a mate in 1 over a mate in 3), so at deeper search the engine may be
-// slow to actually deliver a mate it already "sees" — a reasonable
-// follow-up once this basic version is verified working.
+// A raw checkmate leaf returns ply-MateScore, not a flat -MateScore
+// (see negamax) — this is mate-distance adjustment: a mate found
+// closer to the root (smaller ply) scores CLOSER to ±MateScore than
+// one found deeper, so alpha-beta correctly prefers a faster mate
+// over a slower one, and correctly prefers delaying an unavoidable
+// mate as long as possible when on the losing side. Every non-leaf
+// node just negates its child's score unchanged, so this ply-relative
+// value propagates all the way to the root intact.
 const MateScore = 900_000
+
+// mateThreshold is the boundary used to recognize "this score
+// represents some mate distance, not a normal material/positional
+// eval" — anything at or beyond it is treated as a mate score by
+// storeAdjustMateScore/readAdjustMateScore below. Comfortably below
+// MateScore itself: even an absurdly deep search (thousands of plies)
+// couldn't push a genuine mate-in-N score below this line, while no
+// plausible eval.Evaluate output gets anywhere close to it.
+const mateThreshold = MateScore - 1000
+
+// storeAdjustMateScore converts a mate score from "relative to the
+// search root" (what negamax computes and returns — see MateScore's
+// comment) into "relative to this node" before it's cached in the
+// transposition table. This is the fix for the documented TT bug:
+// without it, a mate score cached while reaching a position at one
+// ply from the root would be silently reused, unmodified, if that
+// SAME position were later reached via a transposing line at a
+// DIFFERENT ply — reporting the wrong mate distance (or in the worst
+// case, treating a non-mate as one, or vice versa, since the absolute
+// numbers no longer line up with the position's actual distance to
+// mate from wherever it's currently being reached). Storing the
+// node-relative value instead means readAdjustMateScore can correctly
+// re-derive the right root-relative number no matter which ply the
+// entry gets read back at.
+func storeAdjustMateScore(score, ply int) int {
+	switch {
+	case score >= mateThreshold:
+		return score + ply
+	case score <= -mateThreshold:
+		return score - ply
+	default:
+		return score
+	}
+}
+
+// readAdjustMateScore is storeAdjustMateScore's exact inverse, applied
+// when a cached score is read back out of the transposition table at
+// the current node's ply (which may differ from the ply it was
+// originally stored at — see storeAdjustMateScore's comment).
+func readAdjustMateScore(score, ply int) int {
+	switch {
+	case score >= mateThreshold:
+		return score - ply
+	case score <= -mateThreshold:
+		return score + ply
+	default:
+		return score
+	}
+}
 
 // --- Transposition table -------------------------------------------
 
@@ -165,7 +218,7 @@ func BestMove(b *board.Board, depth int) (board.Move, error) {
 		return board.Move{}, errors.New("search.BestMove: no legal moves in this position")
 	}
 	tt := NewTranspositionTable()
-	_, bestMove := negamax(b, depth, -Infinity, Infinity, true, tt)
+	_, bestMove := negamax(b, depth, 0, -Infinity, Infinity, true, tt)
 	return bestMove, nil
 }
 
@@ -196,7 +249,7 @@ func BestMoveTimed(b *board.Board, maxDepth int, budget time.Duration) (board.Mo
 		if depth > 1 && time.Since(start) >= budget {
 			break
 		}
-		_, m := negamax(b, depth, -Infinity, Infinity, true, tt)
+		_, m := negamax(b, depth, 0, -Infinity, Infinity, true, tt)
 		bestMove = m
 	}
 	return bestMove, nil
@@ -259,34 +312,40 @@ func hasNonPawnMaterial(b *board.Board, c board.Color) bool {
 // never its move — see the move loop below), but BestMove reads the
 // ROOT call's returned move directly, so the root can never take that
 // shortcut.
-func negamax(b *board.Board, depth, alpha, beta int, isRoot bool, tt *TranspositionTable) (score int, bestMove board.Move) {
+// ply is how many plies deep from the search ROOT this call is (0 at
+// the root, incremented by 1 on every recursive call — including the
+// null-move probe). It exists purely for mate-distance adjustment —
+// see MateScore's comment and storeAdjustMateScore/
+// readAdjustMateScore above — and plays no other role in the search.
+func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *TranspositionTable) (score int, bestMove board.Move) {
 	origAlpha := alpha
 	var hash uint64
 	if tt != nil {
 		hash = b.Hash()
 		if entry, ok := tt.entries[hash]; ok && entry.depth >= depth {
+			adjustedScore := readAdjustMateScore(entry.score, ply)
 			switch entry.bound {
 			case exactBound:
-				return entry.score, entry.move
+				return adjustedScore, entry.move
 			case lowerBound:
-				if entry.score > alpha {
-					alpha = entry.score
+				if adjustedScore > alpha {
+					alpha = adjustedScore
 				}
 			case upperBound:
-				if entry.score < beta {
-					beta = entry.score
+				if adjustedScore < beta {
+					beta = adjustedScore
 				}
 			}
 			if alpha >= beta {
-				return entry.score, entry.move
+				return adjustedScore, entry.move
 			}
 		}
 	}
 
 	switch movegen.GameStatus(b) {
 	case movegen.Checkmate:
-		return -MateScore, board.Move{}
-	case movegen.Stalemate:
+		return ply - MateScore, board.Move{}
+	case movegen.Stalemate, movegen.DrawFiftyMove, movegen.DrawInsufficientMaterial:
 		return 0, board.Move{}
 	}
 
@@ -324,7 +383,7 @@ func negamax(b *board.Board, depth, alpha, beta int, isRoot bool, tt *Transposit
 	if !isRoot && depth >= nullMoveMinDepth && beta < MateScore &&
 		!movegen.InCheck(b) && hasNonPawnMaterial(b, b.SideToMove) {
 		nullChild := b.MakeNullMove()
-		nullScore, _ := negamax(nullChild, depth-1-nullMoveReduction, -beta, -beta+1, false, tt)
+		nullScore, _ := negamax(nullChild, depth-1-nullMoveReduction, ply+1, -beta, -beta+1, false, tt)
 		nullScore = -nullScore
 		if nullScore >= beta {
 			return beta, board.Move{}
@@ -332,7 +391,7 @@ func negamax(b *board.Board, depth, alpha, beta int, isRoot bool, tt *Transposit
 	}
 
 	if depth == 0 {
-		return quiescence(b, alpha, beta), board.Move{}
+		return quiescence(b, ply, alpha, beta), board.Move{}
 	}
 
 	moves := movegen.GenerateLegalMoves(b)
@@ -351,7 +410,7 @@ func negamax(b *board.Board, depth, alpha, beta int, isRoot bool, tt *Transposit
 
 	for _, m := range moves {
 		child := b.MakeMove(m)
-		childScore, _ := negamax(child, depth-1, -beta, -alpha, false, tt)
+		childScore, _ := negamax(child, depth-1, ply+1, -beta, -alpha, false, tt)
 		s := -childScore
 
 		if s > best {
@@ -381,7 +440,7 @@ func negamax(b *board.Board, depth, alpha, beta int, isRoot bool, tt *Transposit
 		} else if best >= beta {
 			resultBound = lowerBound
 		}
-		tt.entries[hash] = ttEntry{depth: depth, score: best, bound: resultBound, move: bestHere}
+		tt.entries[hash] = ttEntry{depth: depth, score: storeAdjustMateScore(best, ply), bound: resultBound, move: bestHere}
 	}
 
 	return best, bestHere
@@ -526,19 +585,26 @@ const maxQuiescenceCheckExtensions = 6
 // negamax stopping exactly at depth 0 mid-capture-exchange would
 // score "I just won a pawn" as good even when the very next move (one
 // ply past the search horizon) recaptures a whole piece back.
-func quiescence(b *board.Board, alpha, beta int) int {
-	return quiescenceSearch(b, alpha, beta, maxQuiescenceCheckExtensions)
+func quiescence(b *board.Board, ply, alpha, beta int) int {
+	return quiescenceSearch(b, ply, alpha, beta, maxQuiescenceCheckExtensions)
 }
 
-func quiescenceSearch(b *board.Board, alpha, beta, checkExtLeft int) int {
+func quiescenceSearch(b *board.Board, ply, alpha, beta, checkExtLeft int) int {
 	inCheck := movegen.InCheck(b)
 	legal := movegen.GenerateLegalMoves(b)
 
 	if len(legal) == 0 {
 		if inCheck {
-			return -MateScore
+			return ply - MateScore
 		}
 		return 0 // stalemate
+	}
+	if b.HalfmoveClock >= 100 || movegen.InsufficientMaterial(b) {
+		return 0 // draw by 50-move rule or insufficient material — same
+		// reasoning as negamax's GameStatus check: quiescence must not
+		// walk past a boundary that's already a rules draw while
+		// chasing a capture sequence, regardless of how "won" the
+		// material looks.
 	}
 
 	// extendForCheck: while in check, there's no "standing pat" —
@@ -586,7 +652,7 @@ func quiescenceSearch(b *board.Board, alpha, beta, checkExtLeft int) int {
 
 	for _, m := range candidates {
 		child := b.MakeMove(m)
-		score := -quiescenceSearch(child, -beta, -alpha, nextCheckExtLeft)
+		score := -quiescenceSearch(child, ply+1, -beta, -alpha, nextCheckExtLeft)
 		if score >= beta {
 			return beta
 		}
