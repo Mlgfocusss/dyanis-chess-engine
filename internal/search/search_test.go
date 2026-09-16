@@ -168,6 +168,58 @@ func TestNullMovePruningKeepsCorrectAnswerAtDepth(t *testing.T) {
 	}
 }
 
+func TestLMRKeepsCorrectAnswerAtDepth(t *testing.T) {
+	// Depth 5 is comfortably past lmrMinDepth, with plenty of quiet
+	// moves past lmrFullDepthMoves in a fairly open position — this
+	// reliably exercises the reduced-depth probe branch during the
+	// search, not just its guards in isolation. Same position as
+	// TestPrefersWinningMaterial/TestNullMovePruningKeepsCorrectAnswerAtDepth,
+	// one depth deeper again: LMR must not cause the engine to miss
+	// the hanging rook, whether by wrongly trusting a reduced probe or
+	// by a bug in the full-depth re-search it triggers.
+	const fen = "3r2k1/8/8/8/8/8/8/3Q2K1 w - - 0 1"
+	b, err := board.FromFEN(fen)
+	if err != nil {
+		t.Fatalf("FEN parse failed: %v", err)
+	}
+
+	m, err := BestMove(b, 5)
+	if err != nil {
+		t.Fatalf("BestMove failed: %v", err)
+	}
+
+	want := "d1d8"
+	if m.String() != want {
+		t.Errorf("expected the engine to still capture the hanging rook with %s at depth 5, got %s", want, m)
+	}
+}
+
+func TestLMRDoesNotBreakDeeperMateSearch(t *testing.T) {
+	// Same verified mate-in-1 position as TestFindsMateInOne and
+	// TestOrderingDoesNotBreakMateSearch, but run through iterative
+	// deepening to a higher maxDepth: this lets LMR actually fire
+	// (reduced probes, and full-depth re-searches when a probe beats
+	// alpha) across several passes on a shared transposition table,
+	// rather than just checking its guards in isolation. The correct
+	// move must not change just because reductions are now part of
+	// how later moves in the list get searched.
+	const fen = "6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1"
+	b, err := board.FromFEN(fen)
+	if err != nil {
+		t.Fatalf("FEN parse failed: %v", err)
+	}
+
+	m, err := BestMoveTimed(b, 6, time.Second)
+	if err != nil {
+		t.Fatalf("BestMoveTimed failed: %v", err)
+	}
+
+	want := "a1a8"
+	if m.String() != want {
+		t.Errorf("expected mate-in-1 move %s, got %s", want, m)
+	}
+}
+
 // findMove locates a legal move by its coordinate-notation string
 // (e.g. "e2e4"), failing the test if it isn't legal in b — a small
 // helper so ordering tests can name moves the same way a person would

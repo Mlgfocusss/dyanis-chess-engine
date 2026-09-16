@@ -45,3 +45,33 @@ func Divide(b *board.Board, depth int) map[string]uint64 {
 	}
 	return result
 }
+
+// VerifyHashes walks the exact same legal-move tree Perft does, and
+// at every single node — not just the leaves — checks
+// board.Board.VerifyHash(): that MakeMove's incrementally-maintained
+// Zobrist hash (see internal/board/move.go) still agrees with a full
+// from-scratch recomputation. Returns the FEN of the first position
+// where they disagree, or "" if none is found anywhere in the tree.
+//
+// This deliberately piggybacks on the same recursive walk Perft/
+// Divide already use, rather than a second, separate traversal:
+// perft's whole point is exercising every kind of move (captures,
+// castling both sides, promotions, en passant) at real game
+// positions, which is exactly the coverage an incremental-hash bug
+// needs to be caught by — building a second parallel traversal just
+// for hash-checking would only be a second place for the two to
+// quietly drift out of sync with each other.
+func VerifyHashes(b *board.Board, depth int) string {
+	if !b.VerifyHash() {
+		return b.ToFEN()
+	}
+	if depth == 0 {
+		return ""
+	}
+	for _, m := range movegen.GenerateLegalMoves(b) {
+		if fen := VerifyHashes(b.MakeMove(m), depth-1); fen != "" {
+			return fen
+		}
+	}
+	return ""
+}

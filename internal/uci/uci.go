@@ -9,7 +9,8 @@
 //	isready      -> "readyok"
 //	ucinewgame   -> reset to the starting position
 //	position ... -> set up a position (startpos or fen) plus a move list
-//	go ...       -> search and respond "bestmove <move>"
+//	go ...       -> search, streaming "info depth/score/nodes/pv" lines
+//	                as it goes, then reply "bestmove <move>"
 //	quit         -> stop the loop
 //
 // "go" without an explicit "depth" uses the fixed depth Loop was given
@@ -196,19 +197,24 @@ func findMoveByCoordinates(pos *board.Board, token string) (board.Move, bool) {
 }
 
 // handleGo implements "go [depth N] [movetime N] [... other params,
-// ignored]" and replies with "bestmove <move>". If bk has a book move
-// for the current position, that's played instead of running search
-// at all — same book-first behavior as the CLI's -play, via
-// search.BestMoveWithBook / search.BestMoveTimedWithBook.
+// ignored]": it streams an "info depth D score S nodes N pv ..." line
+// per completed depth (via search.BestMoveWithBookInfo /
+// search.BestMoveTimedWithBookInfo's onInfo callback — see writeInfo
+// below) and finally replies "bestmove <move>". If bk has a book move
+// for the current position, that's played instead of running search at
+// all — same book-first behavior as the CLI's -play — in which case no
+// "info" line is sent at all, since no search ran to report on.
 //
 // If movetime is given (milliseconds), this uses iterative deepening
 // with that as a time budget, with depth (explicit "depth N" if also
 // given, else the session default) as the max-depth ceiling — the
 // same relationship -movetime/-depth have in the CLI's -play. Without
-// movetime, it's a fixed-depth search as before. wtime/btime/winc/
-// binc/infinite aren't implemented (full clock-based time allocation
-// is a further step beyond this project's current "iterative
-// deepening + a flat per-move budget" scope) and are silently ignored.
+// movetime, it's a fixed-depth search as before (still just ONE "info"
+// line, since there's only ever the one depth to report). wtime/btime/
+// winc/binc/infinite aren't implemented (full clock-based time
+// allocation is a further step beyond this project's current
+// "iterative deepening + a flat per-move budget" scope) and are
+// silently ignored.
 func (s *session) handleGo(args []string) {
 	depth := s.depth
 	movetimeMs := 0
@@ -245,16 +251,42 @@ func (s *session) handleGo(args []string) {
 		s.w.Flush()
 	}
 
+	onInfo := func(info search.SearchInfo) {
+		s.writeInfo(info)
+	}
+
 	var m board.Move
 	var err error
 	if movetimeMs > 0 {
-		m, _, err = search.BestMoveTimedWithBook(s.pos, depth, time.Duration(movetimeMs)*time.Millisecond, s.book)
+		m, _, err = search.BestMoveTimedWithBookInfo(s.pos, depth, time.Duration(movetimeMs)*time.Millisecond, s.book, onInfo)
 	} else {
-		m, _, err = search.BestMoveWithBook(s.pos, depth, s.book)
+		m, _, err = search.BestMoveWithBookInfo(s.pos, depth, s.book, onInfo)
 	}
 	if err != nil {
 		return // no legal move (checkmate/stalemate): nothing sensible to send
 	}
 	fmt.Fprintf(s.w, "bestmove %s\n", m)
+	s.w.Flush()
+}
+
+// writeInfo renders one SearchInfo as a UCI "info" line — depth,
+// score (as "cp N" or "mate N", see search.ScoreToUCI), running node
+// count, and the principal variation as space-separated coordinate
+// moves (e.g. "e2e4 e7e5 g1f3") — then flushes immediately, the same
+// as every other line this session writes, so a GUI watching stdout
+// sees search progress as it happens rather than buffered until
+// "bestmove". pv is omitted entirely (rather than printed empty) when
+// the transposition table couldn't reconstruct one — see
+// principalVariation's comment in search.go for when that happens.
+func (s *session) writeInfo(info search.SearchInfo) {
+	line := fmt.Sprintf("info depth %d score %s nodes %d", info.Depth, search.ScoreToUCI(info.Score), info.Nodes)
+	if len(info.PV) > 0 {
+		pvStrs := make([]string, len(info.PV))
+		for i, m := range info.PV {
+			pvStrs[i] = m.String()
+		}
+		line += " pv " + strings.Join(pvStrs, " ")
+	}
+	fmt.Fprintln(s.w, line)
 	s.w.Flush()
 }

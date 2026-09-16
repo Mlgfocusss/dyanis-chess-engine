@@ -50,12 +50,23 @@ import (
 // throughout — game.bk in cmd/wasm and the CLI's book variable both
 // do this — and this can't happen.
 func BestMoveWithBook(b *board.Board, depth int, bk book.Source) (m board.Move, fromBook bool, err error) {
+	return BestMoveWithBookInfo(b, depth, bk, nil)
+}
+
+// BestMoveWithBookInfo is BestMoveWithBook with an added onInfo
+// callback, forwarded straight to BestMoveInfo when the book doesn't
+// have a move for this position — see BestMoveInfo's comment for when
+// it fires. A book HIT never calls onInfo at all: there's no search
+// info to report when no search ran (see BestMoveWithBook's own
+// comment on why the book is a short-circuit, not part of eval/search
+// proper).
+func BestMoveWithBookInfo(b *board.Board, depth int, bk book.Source, onInfo func(SearchInfo)) (m board.Move, fromBook bool, err error) {
 	if bk != nil {
 		if bm, ok := pickBookMove(b, bk); ok {
 			return bm, true, nil
 		}
 	}
-	m, err = BestMove(b, depth)
+	m, err = BestMoveInfo(b, depth, onInfo)
 	return m, false, err
 }
 
@@ -65,12 +76,21 @@ func BestMoveWithBook(b *board.Board, depth int, bk book.Source) (m board.Move, 
 // into eval. maxDepth/budget are passed straight through to
 // BestMoveTimed when there's no book hit.
 func BestMoveTimedWithBook(b *board.Board, maxDepth int, budget time.Duration, bk book.Source) (m board.Move, fromBook bool, err error) {
+	return BestMoveTimedWithBookInfo(b, maxDepth, budget, bk, nil)
+}
+
+// BestMoveTimedWithBookInfo is BestMoveTimedWithBook with an added
+// onInfo callback, forwarded straight to BestMoveTimedInfo (fired once
+// per completed depth) when the book doesn't have a move for this
+// position — see BestMoveWithBookInfo's comment for why a book HIT
+// never calls onInfo.
+func BestMoveTimedWithBookInfo(b *board.Board, maxDepth int, budget time.Duration, bk book.Source, onInfo func(SearchInfo)) (m board.Move, fromBook bool, err error) {
 	if bk != nil {
 		if bm, ok := pickBookMove(b, bk); ok {
 			return bm, true, nil
 		}
 	}
-	m, err = BestMoveTimed(b, maxDepth, budget)
+	m, err = BestMoveTimedInfo(b, maxDepth, budget, onInfo)
 	return m, false, err
 }
 
