@@ -325,7 +325,11 @@ func principalVariation(b *board.Board, tt *TranspositionTable, maxLen int) []bo
 	}
 
 	var pv []board.Move
-	cur := b
+	// b itself must not be mutated — it's the caller's actual search
+	// root (or, one level up, the receiver negamax was handed) — so
+	// this walk works on a disposable copy instead. Nothing here needs
+	// to unmake anything: the copy is discarded once the loop ends.
+	cur := b.Copy()
 	seen := map[uint64]bool{}
 	for len(pv) < maxLen {
 		hash := cur.Hash()
@@ -339,7 +343,7 @@ func principalVariation(b *board.Board, tt *TranspositionTable, maxLen int) []bo
 			break
 		}
 		pv = append(pv, entry.move)
-		cur = cur.MakeMove(entry.move)
+		cur.MakeMove(entry.move)
 	}
 	return pv
 }
@@ -583,7 +587,19 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 		}
 	}
 
-	switch movegen.GameStatus(b) {
+	// Generated once, right here, and reused for both the terminal-
+	// status check immediately below and the move loop further down
+	// (after null-move pruning and the depth==0 quiescence handoff,
+	// neither of which need this list themselves). Generating a
+	// position's legal moves is by far the most expensive part of a
+	// search node — a full pseudo-legal pass plus a king-safety filter
+	// per candidate — so computing it twice per node (once inside
+	// GameStatus, once for the move loop, as this used to do) was a
+	// real, measurable chunk of total search time, not a
+	// micro-optimization.
+	moves := movegen.GenerateLegalMoves(b)
+
+	switch movegen.GameStatusFromMoves(b, moves) {
 	case movegen.Checkmate:
 		return ply - MateScore, board.Move{}
 	case movegen.Stalemate, movegen.DrawFiftyMove, movegen.DrawInsufficientMaterial:
@@ -630,9 +646,10 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 	//     isn't worth attempting.
 	if !isRoot && depth >= nullMoveMinDepth && beta < MateScore &&
 		!inCheck && hasNonPawnMaterial(b, b.SideToMove) {
-		nullChild := b.MakeNullMove()
-		nullScore, _ := negamax(nullChild, depth-1-nullMoveReduction, ply+1, -beta, -beta+1, false, tt)
+		nullUndo := b.MakeNullMove()
+		nullScore, _ := negamax(b, depth-1-nullMoveReduction, ply+1, -beta, -beta+1, false, tt)
 		nullScore = -nullScore
+		b.UnmakeNullMove(nullUndo)
 		if nullScore >= beta {
 			return beta, board.Move{}
 		}
@@ -642,7 +659,9 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 		return quiescence(b, ply, alpha, beta, tt), board.Move{}
 	}
 
-	moves := movegen.GenerateLegalMoves(b)
+	// moves was already generated above, right after the TT lookup —
+	// reused here rather than generated a second time (see the
+	// comment there).
 
 	var ttMove board.Move
 	hasTTMove := false
@@ -654,10 +673,10 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 	orderMoves(b, moves, ttMove, hasTTMove, depth, tt)
 
 	best := -Infinity
-	bestHere := moves[0] // GameStatus above already ruled out the empty-moves case
+	bestHere := moves[0] // GameStatusFromMoves above already ruled out the empty-moves case
 
 	for i, m := range moves {
-		child := b.MakeMove(m)
+		undo := b.MakeMove(m)
 
 		// Late Move Reductions guard: move ordering has already put
 		// its best guesses (TT move, captures by MVV-LVA, killers,
@@ -684,7 +703,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 			// probe/re-search dance below exists to cheaply REJECT
 			// moves that don't beat alpha, and this move is expected
 			// to set alpha, not merely clear it.
-			childScore, _ := negamax(child, depth-1, ply+1, -beta, -alpha, false, tt)
+			childScore, _ := negamax(b, depth-1, ply+1, -beta, -alpha, false, tt)
 			s = -childScore
 		} else {
 			// Every later move: a cheap null-window probe first — a
@@ -700,7 +719,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 			if reduceEligible {
 				searchDepth = depth - 1 - lmrReduction
 			}
-			probeScore, _ := negamax(child, searchDepth, ply+1, -alpha-1, -alpha, false, tt)
+			probeScore, _ := negamax(b, searchDepth, ply+1, -alpha-1, -alpha, false, tt)
 			s = -probeScore
 
 			if reduceEligible && s > alpha {
@@ -709,7 +728,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 				// real signal. Re-confirm with the same cheap null
 				// window at full depth before paying for a
 				// full-window search.
-				probeScore, _ = negamax(child, depth-1, ply+1, -alpha-1, -alpha, false, tt)
+				probeScore, _ = negamax(b, depth-1, ply+1, -alpha-1, -alpha, false, tt)
 				s = -probeScore
 			}
 
@@ -718,10 +737,12 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 				// not" — it can't pin down the real score once that's
 				// yes. Only a move that earned it gets the full-
 				// window search that actually establishes its value.
-				fullScore, _ := negamax(child, depth-1, ply+1, -beta, -alpha, false, tt)
+				fullScore, _ := negamax(b, depth-1, ply+1, -beta, -alpha, false, tt)
 				s = -fullScore
 			}
 		}
+
+		b.UnmakeMove(m, undo)
 
 		if s > best {
 			best = s
@@ -970,8 +991,9 @@ func quiescenceSearch(b *board.Board, ply, alpha, beta, checkExtLeft int, tt *Tr
 	}
 
 	for _, m := range candidates {
-		child := b.MakeMove(m)
-		score := -quiescenceSearch(child, ply+1, -beta, -alpha, nextCheckExtLeft, tt)
+		undo := b.MakeMove(m)
+		score := -quiescenceSearch(b, ply+1, -beta, -alpha, nextCheckExtLeft, tt)
+		b.UnmakeMove(m, undo)
 		if score >= beta {
 			return beta
 		}

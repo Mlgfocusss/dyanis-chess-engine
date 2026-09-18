@@ -73,19 +73,42 @@ func InCheck(b *board.Board) bool {
 // same reasoning: it's intrinsic state a Board CAN carry, unlike a
 // full position log). Use GameStatusWithHistory for that.
 //
-// search's negamax and quiescence call this form deliberately: they
-// walk one board at a time without threading a position history
-// through the recursion (see search.go), so they catch 50-move draws
-// but not repetition ones. That asymmetry is acceptable for search's
-// purposes — a fixed-depth tree can't loop forever the way real,
-// unbounded play can, so the practical failure mode README warned
-// about (the engine shuffling forever in a real game) is already
-// closed by GameStatusWithHistory at the game-loop level below; not
-// seeing repetitions inside its own lookahead just means search is
+// This is a thin wrapper around GameStatusFromMoves for callers that
+// don't already have the position's legal move list lying around
+// (cmd/cli, wasm, UCI). A caller that DOES already have it — search's
+// negamax needs it anyway, right after this same check, for move
+// ordering — should call GameStatusFromMoves directly instead:
+// generating the legal move list is by far the most expensive part of
+// this check (it's a full pseudo-legal generation plus a king-safety
+// filter per candidate), so computing it twice per node for the same
+// position is a real, measurable cost in a search that calls this
+// once per node.
+func GameStatus(b *board.Board) Status {
+	return GameStatusFromMoves(b, GenerateLegalMoves(b))
+}
+
+// GameStatusFromMoves is GameStatus for a caller that has already
+// computed b's legal move list — see GameStatus's doc comment for
+// when to prefer this. legal MUST be GenerateLegalMoves(b)'s actual,
+// current result for this exact b (not a stale list from a different
+// position, and not a filtered/partial one) — this trusts it as-is
+// rather than re-deriving or re-validating it, which is the entire
+// point of taking it as a parameter instead of a *board.Board alone.
+//
+// search's negamax and quiescence call this form (or the equivalent
+// inlined logic, for quiescence) deliberately: they walk one board at
+// a time without threading a position history through the recursion
+// (see search.go), so they catch 50-move draws but not repetition
+// ones. That asymmetry is acceptable for search's purposes — a
+// fixed-depth tree can't loop forever the way real, unbounded play
+// can, so the practical failure mode README warned about (the engine
+// shuffling forever in a real game) is already closed by
+// GameStatusWithHistory at the game-loop level below; not seeing
+// repetitions inside its own lookahead just means search is
 // occasionally a little less precise about lines that transpose back
 // into an earlier position, not unsafe.
-func GameStatus(b *board.Board) Status {
-	if len(GenerateLegalMoves(b)) > 0 {
+func GameStatusFromMoves(b *board.Board, legal []board.Move) Status {
+	if len(legal) > 0 {
 		if InsufficientMaterial(b) {
 			return DrawInsufficientMaterial
 		}

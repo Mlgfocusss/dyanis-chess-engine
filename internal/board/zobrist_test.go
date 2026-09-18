@@ -18,13 +18,21 @@ func TestHashMatchesKnownPolyglotConstant(t *testing.T) {
 }
 
 func TestHashChangesAfterAMove(t *testing.T) {
-	before := NewInitialBoard()
+	b := NewInitialBoard()
+	beforeHash := b.Hash()
+
 	e2, _ := ParseSquare("e2")
 	e4, _ := ParseSquare("e4")
-	after := before.MakeMove(Move{From: e2, To: e4, Flag: DoublePawnPush})
+	m := Move{From: e2, To: e4, Flag: DoublePawnPush}
+	undo := b.MakeMove(m)
 
-	if before.Hash() == after.Hash() {
+	if beforeHash == b.Hash() {
 		t.Error("Hash() should differ between the starting position and after 1.e4")
+	}
+
+	b.UnmakeMove(m, undo)
+	if b.Hash() != beforeHash {
+		t.Error("Hash() should be restored to the pre-move value after UnmakeMove")
 	}
 }
 
@@ -45,20 +53,36 @@ func TestEnPassantOnlyHashedWhenCapturable(t *testing.T) {
 		b.Squares[MakeSquare(4, 4)] = BP // the pawn that just double-pushed, sits on e5
 		return b
 	}
+	// seed recomputes b.hash from scratch — needed because these test
+	// boards are built via a raw struct literal (not NewInitialBoard/
+	// FromFEN, the only two callers that normally seed it), so b.hash
+	// would otherwise sit at its zero value the whole way through.
+	// Called AFTER every field this test cares about (EnPassant, extra
+	// pawns) has already been set, since computeHashFromScratch reads
+	// the board exactly as it stands at the moment it's called.
+	seed := func(b *Board) *Board {
+		b.hash = b.computeHashFromScratch()
+		return b
+	}
 
-	noCapturer := base()
-	noCapturer.EnPassant = e6
+	noCapturer := seed(func() *Board {
+		b := base()
+		b.EnPassant = e6
+		return b
+	}())
 
-	withoutEPAtAll := base()
-	withoutEPAtAll.EnPassant = NoSquare
+	withoutEPAtAll := seed(base())
 
 	if noCapturer.Hash() != withoutEPAtAll.Hash() {
 		t.Error("en passant square set but no pawn can capture: hash should match EnPassant=NoSquare")
 	}
 
-	withCapturer := base()
-	withCapturer.EnPassant = e6
-	withCapturer.Squares[d5] = WP
+	withCapturer := seed(func() *Board {
+		b := base()
+		b.EnPassant = e6
+		b.Squares[d5] = WP
+		return b
+	}())
 
 	if withCapturer.Hash() == withoutEPAtAll.Hash() {
 		t.Error("en passant square set with a pawn actually able to capture: hash should differ from EnPassant=NoSquare")

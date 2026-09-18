@@ -178,7 +178,7 @@ func (s *session) handlePosition(args []string) {
 			if !ok {
 				return // stop applying at the first move that doesn't match
 			}
-			pos = pos.MakeMove(m)
+			pos.MakeMove(m)
 			history = append(history, pos.Hash())
 		}
 	}

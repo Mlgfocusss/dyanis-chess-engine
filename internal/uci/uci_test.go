@@ -17,7 +17,7 @@ func encode(fromFile, fromRank, toFile, toRank int, promo uint16) uint16 {
 	return uint16(toFile) | uint16(toRank)<<3 | uint16(fromFile)<<6 | uint16(fromRank)<<9 | promo<<12
 }
 
-func run(t *testing.T, input string, depth int, bk *book.Book) string {
+func run(t *testing.T, input string, depth int, bk book.Source) string {
 	t.Helper()
 	var out bytes.Buffer
 	Loop(bufio.NewReader(strings.NewReader(input)), bufio.NewWriter(&out), depth, bk)

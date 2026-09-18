@@ -41,38 +41,70 @@ func (m Move) IsCapture() bool {
 	return m.Flag == Capture || m.Flag == EnPassantCapture || m.Flag == PromotionCapture
 }
 
-// MakeNullMove returns a copy of the board with the side to move
-// flipped and nothing else changed on the board itself — used by
-// search's null-move pruning ("if I skip my turn entirely, is this
-// position still good enough for me? if even doing NOTHING doesn't
-// let the opponent punish me, a real move certainly won't, so this
-// subtree can be pruned"). Not a legal chess move — passing turns
-// isn't something a real player can do — purely a search heuristic.
+// NullUndo is what MakeNullMove needs to save so UnmakeNullMove can put
+// the board back exactly as it was — same idea as Undo below, just for
+// the narrower set of fields a null move touches.
+type NullUndo struct {
+	EnPassantBefore      Square
+	HalfmoveClockBefore  int
+	FullmoveNumberBefore int
+	HashBefore           uint64
+}
+
+// MakeNullMove flips the side to move and clears en passant, mutating
+// the board in place — used by search's null-move pruning ("if I skip
+// my turn entirely, is this position still good enough for me? if even
+// doing NOTHING doesn't let the opponent punish me, a real move
+// certainly won't, so this subtree can be pruned"). Not a legal chess
+// move — passing turns isn't something a real player can do — purely a
+// search heuristic. Pair with UnmakeNullMove to restore the board
+// afterward; every recursive caller is expected to do so before
+// returning, the same discipline as MakeMove/UnmakeMove below.
 //
-// EnPassant is cleared, same as a real move would leave it unless
-// that move was itself a double pawn push: the capture window is only
-// ever open for the one immediately following move, and skipping a
-// turn means that move didn't happen.
-func (b *Board) MakeNullMove() *Board {
-	nb := b.Copy()
+// EnPassant is cleared, same as a real move would leave it unless that
+// move was itself a double pawn push: the capture window is only ever
+// open for the one immediately following move, and skipping a turn
+// means that move didn't happen.
+func (b *Board) MakeNullMove() NullUndo {
+	undo := NullUndo{
+		EnPassantBefore:      b.EnPassant,
+		HalfmoveClockBefore:  b.HalfmoveClock,
+		FullmoveNumberBefore: b.FullmoveNumber,
+		HashBefore:           b.hash,
+	}
 
 	// Incremental hash update: a null move only ever changes two
 	// things about the position — en passant (always cleared, since
 	// the capture window is only open for the one immediately
 	// following move, and skipping a turn means that move didn't
 	// happen) and side to move (every move, real or null, flips it).
+	// Both checks below run against the board's PRE-move state
+	// (b.EnPassant, b.SideToMove), same as the copying version used —
+	// nothing has been mutated yet at this point.
 	if b.EnPassant != NoSquare && enPassantCaptureIsPossible(b) {
-		nb.hash ^= polyglotRandom64[772+b.EnPassant.File()]
+		b.hash ^= polyglotRandom64[772+b.EnPassant.File()]
 	}
-	nb.hash ^= polyglotRandom64[780]
+	b.hash ^= polyglotRandom64[780]
 
-	nb.EnPassant = NoSquare
-	nb.HalfmoveClock++
+	b.EnPassant = NoSquare
+	b.HalfmoveClock++
 	if b.SideToMove == Black {
-		nb.FullmoveNumber = b.FullmoveNumber + 1
+		b.FullmoveNumber++
 	}
-	nb.SideToMove = b.SideToMove.Opposite()
-	return nb
+	b.SideToMove = b.SideToMove.Opposite()
+	return undo
+}
+
+// UnmakeNullMove is MakeNullMove's exact inverse: restore every field
+// straight from the snapshot NullUndo took, rather than trying to
+// reverse the hash XORs by hand — simpler, and correct regardless of
+// how MakeNullMove's own hash bookkeeping is implemented internally.
+func (b *Board) UnmakeNullMove(u NullUndo) {
+	b.SideToMove = b.SideToMove.Opposite()
+	b.EnPassant = u.EnPassantBefore
+	b.HalfmoveClock = u.HalfmoveClockBefore
+	b.FullmoveNumber = u.FullmoveNumberBefore
+	b.hash = u.HashBefore
 }
 
 // rookSquaresForCastle returns the rook's from/to squares for a given
@@ -88,47 +120,77 @@ func rookSquaresForCastle(c Color, side MoveFlag) (from, to Square) {
 	return MakeSquare(0, rank), MakeSquare(3, rank)
 }
 
-// MakeMove applies m to a *copy* of the board and returns the new board.
-// The receiver is left untouched, which keeps move generation simple
-// (generate pseudo-legal move -> try it on a copy -> check king safety)
-// at the cost of allocating a new Board per move. This is the "easy but
-// not fastest" approach the project plan accepts for the early steps;
-// a make/unmake-with-undo version can replace it later once perft
-// tests pass and profiling shows it matters.
-func (b *Board) MakeMove(m Move) *Board {
-	nb := b.Copy()
+// Undo is what MakeMove needs to save before mutating the board so
+// UnmakeMove can put it back exactly as it was: the piece that stood
+// on m.From before the move (the pawn itself for a promotion, not the
+// promoted piece — that's what needs to reappear on m.From when
+// unmaking), whatever piece was captured and the square it was
+// captured FROM (differs from m.To only for en passant), and a
+// snapshot of every board-wide field the move could have changed.
+//
+// The snapshot fields (CastlingBefore..HashBefore) are restored
+// VERBATIM by UnmakeMove rather than reconstructed by re-deriving
+// them from m — e.g. hash is put back by direct assignment, not by
+// replaying MakeMove's XORs in reverse. That's deliberately simpler
+// and, unlike a hand-reversed XOR sequence, correct independently of
+// how MakeMove's own hash bookkeeping happens to be organized.
+type Undo struct {
+	MovedPiece     Piece
+	CapturedPiece  Piece
+	CapturedSquare Square // NoSquare if m wasn't a capture
 
-	mover := nb.Squares[m.From]
+	CastlingBefore       CastlingRights
+	EnPassantBefore      Square
+	HalfmoveClockBefore  int
+	FullmoveNumberBefore int
+	HashBefore           uint64
+}
+
+// MakeMove applies m to the board IN PLACE and returns an Undo that
+// UnmakeMove needs to reverse it. This replaces the old copy-per-move
+// approach (see board.go's Copy comment) now that correctness is
+// established via perft — mutating in place avoids allocating a new
+// Board on every node of the search tree. Every caller MUST pair this
+// with a matching UnmakeMove(m, undo) once it's done looking at the
+// resulting position (typically: right after the recursive call(s)
+// that examine it return), the same "make, look, unmake" discipline
+// negamax and GenerateLegalMoves below follow.
+func (b *Board) MakeMove(m Move) Undo {
+	mover := b.Squares[m.From]
 	movingColor := mover.Color()
 
-	// Side to move is set here rather than at the end (as the original
-	// non-hashed version did) because the incremental en passant hash
-	// update below — specifically the "is this NEW en passant square
-	// actually capturable" check — needs enPassantCaptureIsPossible to
-	// see whose turn it's about to BE (the opponent, who could capture
-	// on their next move), not whose turn it just was. Nothing else in
-	// this function reads nb.SideToMove before this point, so moving
-	// the assignment earlier changes nothing else.
-	nb.SideToMove = movingColor.Opposite()
+	undo := Undo{
+		MovedPiece:           mover,
+		CapturedSquare:       NoSquare,
+		CastlingBefore:       b.Castling,
+		EnPassantBefore:      b.EnPassant,
+		HalfmoveClockBefore:  b.HalfmoveClock,
+		FullmoveNumberBefore: b.FullmoveNumber,
+		HashBefore:           b.hash,
+	}
 
 	// Incremental hash update, old en passant contribution: remove
 	// whatever b's en passant square was contributing (only ever
 	// nonzero if it was geometrically capturable — see
-	// enPassantCaptureIsPossible), BEFORE nb.EnPassant gets
-	// overwritten below. Every move clears or replaces it one way or
-	// another, so the old contribution never survives unchanged.
+	// enPassantCaptureIsPossible), BEFORE b.EnPassant gets overwritten
+	// below. This must run before b.SideToMove changes too —
+	// enPassantCaptureIsPossible needs to see the mover's own side
+	// still current, exactly as it did when it ran against the
+	// not-yet-mutated receiver in the old copying version. Every move
+	// clears or replaces the en passant square one way or another, so
+	// the old contribution never survives unchanged.
 	if b.EnPassant != NoSquare && enPassantCaptureIsPossible(b) {
-		nb.hash ^= polyglotRandom64[772+b.EnPassant.File()]
+		b.hash ^= polyglotRandom64[772+b.EnPassant.File()]
 	}
 
 	// Default: en passant is only available for one half-move.
-	nb.EnPassant = NoSquare
+	b.EnPassant = NoSquare
 
 	// 50-move rule bookkeeping: reset on pawn move or capture.
 	if mover.Type() == Pawn || m.IsCapture() {
-		nb.HalfmoveClock = 0
+		b.HalfmoveClock = 0
 	} else {
-		nb.HalfmoveClock++
+		b.HalfmoveClock++
 	}
 
 	switch m.Flag {
@@ -136,62 +198,81 @@ func (b *Board) MakeMove(m Move) *Board {
 		// The captured pawn is NOT on the destination square: it sits
 		// on the same rank as the moving pawn, same file as the target.
 		capturedSq := MakeSquare(m.To.File(), m.From.Rank())
-		captured := nb.Squares[capturedSq]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(capturedSq)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		nb.Squares[capturedSq] = None
-		nb.Squares[m.To] = mover
-		nb.Squares[m.From] = None
+		captured := b.Squares[capturedSq]
+		undo.CapturedPiece = captured
+		undo.CapturedSquare = capturedSq
+		b.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(capturedSq)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
+		b.Squares[capturedSq] = None
+		b.Squares[m.To] = mover
+		b.Squares[m.From] = None
 
 	case CastleKingside, CastleQueenside:
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		nb.Squares[m.To] = mover
-		nb.Squares[m.From] = None
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
+		b.Squares[m.To] = mover
+		b.Squares[m.From] = None
 		rFrom, rTo := rookSquaresForCastle(movingColor, m.Flag)
-		rook := nb.Squares[rFrom]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(rook)+int(rFrom)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(rook)+int(rTo)]
-		nb.Squares[rTo] = rook
-		nb.Squares[rFrom] = None
+		rook := b.Squares[rFrom]
+		b.hash ^= polyglotRandom64[64*pieceIndex(rook)+int(rFrom)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(rook)+int(rTo)]
+		b.Squares[rTo] = rook
+		b.Squares[rFrom] = None
 
 	case Promotion, PromotionCapture:
 		if m.Flag == PromotionCapture {
-			captured := nb.Squares[m.To]
-			nb.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(m.To)]
+			captured := b.Squares[m.To]
+			undo.CapturedPiece = captured
+			undo.CapturedSquare = m.To
+			b.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(m.To)]
 		}
 		promoted := MakePiece(m.Promotion, movingColor)
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(promoted)+int(m.To)]
-		nb.Squares[m.To] = promoted
-		nb.Squares[m.From] = None
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(promoted)+int(m.To)]
+		b.Squares[m.To] = promoted
+		b.Squares[m.From] = None
 
 	case DoublePawnPush:
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		nb.Squares[m.To] = mover
-		nb.Squares[m.From] = None
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
+		b.Squares[m.To] = mover
+		b.Squares[m.From] = None
 		// The en passant target is the square the pawn "skipped over".
 		skipped := (int(m.From) + int(m.To)) / 2
-		nb.EnPassant = Square(skipped)
+		b.EnPassant = Square(skipped)
 
 	default: // Quiet, Capture
 		if m.Flag == Capture {
-			captured := nb.Squares[m.To]
-			nb.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(m.To)]
+			captured := b.Squares[m.To]
+			undo.CapturedPiece = captured
+			undo.CapturedSquare = m.To
+			b.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(m.To)]
 		}
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
-		nb.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		nb.Squares[m.To] = mover
-		nb.Squares[m.From] = None
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
+		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
+		b.Squares[m.To] = mover
+		b.Squares[m.From] = None
+	}
+
+	// King-square cache: only Quiet/Capture/CastleKingside/
+	// CastleQueenside can ever move a king (a pawn can't promote INTO
+	// a king, and en passant only ever moves a pawn) — m.To is already
+	// the real king destination in every one of those cases (for
+	// castling specifically, the normalized g1/c1/g8/c8 square, not
+	// Polyglot's "king takes rook" encoding — see rookSquaresForCastle
+	// and DecodeMove's normalizeCastling in internal/book). Placed
+	// after the switch so it applies uniformly to all of them with one
+	// check instead of duplicating it in each branch.
+	if mover.Type() == King {
+		b.kingSq[movingColor] = m.To
 	}
 
 	// Update castling rights: moving a king or rook, or capturing a
 	// rook on its home square, permanently removes the relevant right.
-	oldCastling := nb.Castling
-	nb.Castling &= castlingMaskAfterMoveFrom(m.From)
-	nb.Castling &= castlingMaskAfterMoveFrom(m.To)
+	oldCastling := b.Castling
+	b.Castling &= castlingMaskAfterMoveFrom(m.From)
+	b.Castling &= castlingMaskAfterMoveFrom(m.To)
 
 	// Incremental hash update, castling rights: Polyglot hashes each
 	// of the four rights independently (XOR-toggle style — see
@@ -199,38 +280,103 @@ func (b *Board) MakeMove(m Move) *Board {
 	// here. Rights are only ever lost in this engine, never regained,
 	// so "revoked" (was set, now isn't) is the only direction that can
 	// happen — no XOR-in case to handle.
-	revoked := oldCastling &^ nb.Castling
+	revoked := oldCastling &^ b.Castling
 	if revoked&WhiteKingside != 0 {
-		nb.hash ^= polyglotRandom64[768]
+		b.hash ^= polyglotRandom64[768]
 	}
 	if revoked&WhiteQueenside != 0 {
-		nb.hash ^= polyglotRandom64[769]
+		b.hash ^= polyglotRandom64[769]
 	}
 	if revoked&BlackKingside != 0 {
-		nb.hash ^= polyglotRandom64[770]
+		b.hash ^= polyglotRandom64[770]
 	}
 	if revoked&BlackQueenside != 0 {
-		nb.hash ^= polyglotRandom64[771]
+		b.hash ^= polyglotRandom64[771]
 	}
 
-	// Incremental hash update, new en passant contribution: nb's own
-	// SideToMove is already set to the opponent (see the top of this
-	// function), which is exactly what enPassantCaptureIsPossible
-	// needs — it asks "does the side about to move have a pawn
-	// positioned to capture here", and after THIS move, that's
-	// whoever's turn is next, not movingColor.
-	if nb.EnPassant != NoSquare && enPassantCaptureIsPossible(nb) {
-		nb.hash ^= polyglotRandom64[772+nb.EnPassant.File()]
+	// Side to move flips here, right before the two checks below that
+	// need to see it already flipped — nothing between here and the
+	// end of the function reads it any earlier than that.
+	b.SideToMove = movingColor.Opposite()
+
+	// Incremental hash update, new en passant contribution:
+	// b.SideToMove is already the opponent (just flipped above), which
+	// is exactly what enPassantCaptureIsPossible needs — it asks "does
+	// the side about to move have a pawn positioned to capture here",
+	// and after THIS move, that's whoever's turn is next, not
+	// movingColor.
+	if b.EnPassant != NoSquare && enPassantCaptureIsPossible(b) {
+		b.hash ^= polyglotRandom64[772+b.EnPassant.File()]
 	}
 
 	// Side to move always toggles, every move.
-	nb.hash ^= polyglotRandom64[780]
+	b.hash ^= polyglotRandom64[780]
 
 	if movingColor == Black {
-		nb.FullmoveNumber = b.FullmoveNumber + 1
+		b.FullmoveNumber = undo.FullmoveNumberBefore + 1
 	}
 
-	return nb
+	return undo
+}
+
+// UnmakeMove reverses the most recent MakeMove(m), given the Undo it
+// returned. Callers must unmake moves in the exact reverse order they
+// were made (a plain stack discipline — search's recursion already
+// gives this for free, since a node only unmakes the move it just made
+// once its own recursive calls, which make and unmake their own moves
+// first, have returned).
+func (b *Board) UnmakeMove(m Move, u Undo) {
+	movingColor := u.MovedPiece.Color()
+
+	switch m.Flag {
+	case EnPassantCapture:
+		b.Squares[m.From] = u.MovedPiece
+		b.Squares[m.To] = None
+		b.Squares[u.CapturedSquare] = u.CapturedPiece
+
+	case CastleKingside, CastleQueenside:
+		b.Squares[m.From] = u.MovedPiece
+		b.Squares[m.To] = None
+		rFrom, rTo := rookSquaresForCastle(movingColor, m.Flag)
+		b.Squares[rFrom] = b.Squares[rTo]
+		b.Squares[rTo] = None
+
+	case Promotion, PromotionCapture:
+		// The pawn goes back on m.From — MovedPiece was captured
+		// BEFORE promotion happened, so it's still the pawn, never the
+		// promoted piece.
+		b.Squares[m.From] = u.MovedPiece
+		if m.Flag == PromotionCapture {
+			b.Squares[m.To] = u.CapturedPiece
+		} else {
+			b.Squares[m.To] = None
+		}
+
+	default: // Quiet, Capture, DoublePawnPush
+		b.Squares[m.From] = u.MovedPiece
+		if m.Flag == Capture {
+			b.Squares[m.To] = u.CapturedPiece
+		} else {
+			b.Squares[m.To] = None
+		}
+	}
+
+	// King-square cache: mirror image of the update in MakeMove — see
+	// its comment. u.MovedPiece is the piece as it stood on m.From
+	// before the move (never the promoted piece even for a promotion,
+	// which can't apply to a king anyway), so checking its type here
+	// is exactly equivalent to checking mover's type was King in
+	// MakeMove.
+	if u.MovedPiece.Type() == King {
+		b.kingSq[movingColor] = m.From
+	}
+
+	b.Castling = u.CastlingBefore
+	b.EnPassant = u.EnPassantBefore
+	b.HalfmoveClock = u.HalfmoveClockBefore
+	b.FullmoveNumber = u.FullmoveNumberBefore
+	b.hash = u.HashBefore
+	b.SideToMove = movingColor
 }
 
 // castlingMaskAfterMoveFrom returns a mask to AND into Castling rights

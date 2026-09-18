@@ -217,7 +217,7 @@ func playInteractive(b *board.Board, w *bufio.Writer, depth, movetimeMs int, bk 
 			fmt.Fprintf(w, "you played: %s\n", san)
 		}
 
-		b = b.MakeMove(m)
+		b.MakeMove(m)
 		history = append(history, b.Hash())
 	}
 }

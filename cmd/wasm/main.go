@@ -36,14 +36,40 @@ import (
 	"github.com/yourname/dyanis-chess-engine/internal/search"
 )
 
+// moveRecord is one played move plus what UnmakeMove needs to reverse
+// it — exactly the (Move, Undo) pair board.Board.MakeMove/UnmakeMove
+// are built around (see internal/board/move.go). Undo alone isn't
+// enough on its own; UnmakeMove needs the original Move too.
+type moveRecord struct {
+	move board.Move
+	undo board.Undo
+}
+
 // game holds all mutable state for one browser-side session. A wasm
 // module is loaded once per page and this program never exits (main
 // blocks forever on select{}), so package-level state here plays the
 // same role uci.session did for the UCI loop — except there's only
 // ever one "session", the page itself.
+//
+// There is exactly ONE live *board.Board for the whole game: pos.
+// Every played move mutates it in place via MakeMove (see
+// internal/board/move.go's make/unmake design) rather than producing
+// a new Board — so, unlike the old copy-per-move version of this
+// file, undo history can no longer be "an array of board snapshots"
+// (every entry would just be the same mutating pointer, silently
+// rewritten out from under you by the next move). Instead, moves
+// tracks one (Move, Undo) pair per ply played; jsUndo reverses the
+// most recent one with pos.UnmakeMove(rec.move, rec.undo) rather than
+// switching which *Board is "current". hashes is kept as its own
+// parallel slice (rather than re-deriving it from moves on every call)
+// purely because GameStatusWithHistory wants []uint64 directly, and
+// walking pos forward/back through moves just to re-collect hashes on
+// every buildState call would be wasted work for no benefit over
+// just appending/trimming one more slice alongside moves.
 var game = struct {
 	pos      *board.Board
-	history  []*board.Board // history[0] is the starting position; used for undo
+	moves    []moveRecord // one entry per ply played so far; used by jsUndo
+	hashes   []uint64     // hashes[0] = starting position; hashes[i+1] = position after moves[i]
 	sanMoves []string
 
 	// books holds every book loaded so far, in the order loadBook was
@@ -84,7 +110,8 @@ func resetGame(startFEN string) error {
 		b = parsed
 	}
 	game.pos = b
-	game.history = []*board.Board{b}
+	game.moves = nil
+	game.hashes = []uint64{b.Hash()}
 	game.sanMoves = nil
 	return nil
 }
@@ -148,19 +175,15 @@ type moveResponse struct {
 	State    stateResponse `json:"state"`
 }
 
-// historyHashes maps game.history (kept as full boards, for undo) to
-// the Zobrist hashes GameStatusWithHistory needs for repetition
-// detection. Recomputed on every buildState call rather than cached
-// alongside game.history — same "just recompute Hash() from scratch"
-// tradeoff Board.Hash() itself already makes (see its doc comment):
-// fine at the game lengths a casual browser game reaches, worth
-// caching per-position if it ever shows up in profiling.
+// historyHashes returns the Zobrist hash of every position reached so
+// far in the game, in order, INCLUDING the current one — exactly what
+// GameStatusWithHistory needs for its repetition check (see that
+// function's doc comment in internal/movegen/status.go). Just game's
+// own hashes slice, kept up to date by applyMove/jsUndo rather than
+// re-derived from game.pos on every call — see game's doc comment for
+// why a parallel []uint64 replaced walking board snapshots here.
 func historyHashes() []uint64 {
-	hashes := make([]uint64, len(game.history))
-	for i, pos := range game.history {
-		hashes[i] = pos.Hash()
-	}
-	return hashes
+	return game.hashes
 }
 
 func buildState() stateResponse {
@@ -263,13 +286,19 @@ func jsMakeMove(this js.Value, args []js.Value) any {
 }
 
 // Dyanis.undo() -> moveResponse JSON. No-op (ok:false) if there's
-// nothing to undo (i.e. we're at the starting position).
+// nothing to undo (i.e. we're at the starting position). Reverses the
+// most recently played ply with pos.UnmakeMove — there's only ever
+// the one *board.Board (game.pos); this puts it back to exactly how
+// it stood before that move, the same way search.go unwinds its own
+// recursion (see move.go's Undo doc comment).
 func jsUndo(this js.Value, args []js.Value) any {
-	if len(game.history) <= 1 {
+	if len(game.moves) == 0 {
 		return toJSON(moveResponse{OK: false, Error: "nothing to undo", State: buildState()})
 	}
-	game.history = game.history[:len(game.history)-1]
-	game.pos = game.history[len(game.history)-1]
+	last := game.moves[len(game.moves)-1]
+	game.pos.UnmakeMove(last.move, last.undo)
+	game.moves = game.moves[:len(game.moves)-1]
+	game.hashes = game.hashes[:len(game.hashes)-1]
 	game.sanMoves = game.sanMoves[:len(game.sanMoves)-1]
 	return toJSON(moveResponse{OK: true, State: buildState()})
 }
@@ -450,13 +479,19 @@ func jsSearchMove(this js.Value, args []js.Value) any {
 // --- helpers ------------------------------------------------------------
 
 // applyMove plays m (already validated as legal, from position b) and
-// records it into game state: the new position, undo history, and
-// SAN move log. san is computed BEFORE MakeMove, same as the CLI's
-// -play — SAN needs the "before" position to render correctly.
+// records it into game state: the move itself (mutating game.pos, the
+// one and only live board, in place), its Undo (so jsUndo can reverse
+// it later), the resulting hash, and the SAN move log. san is
+// computed BEFORE MakeMove, same as the CLI's -play — SAN needs the
+// "before" position to render correctly. b is always game.pos itself
+// (every caller passes that in) — b is a plain, un-renamed alias, not
+// a separate board, so no reassignment back into game.pos is needed
+// after MakeMove the way the old copy-per-move version needed one.
 func applyMove(b *board.Board, m board.Move) {
 	san := movegen.SAN(b, m)
-	game.pos = b.MakeMove(m)
-	game.history = append(game.history, game.pos)
+	undo := b.MakeMove(m)
+	game.moves = append(game.moves, moveRecord{move: m, undo: undo})
+	game.hashes = append(game.hashes, b.Hash())
 	game.sanMoves = append(game.sanMoves, san)
 }
 

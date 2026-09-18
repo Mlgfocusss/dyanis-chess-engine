@@ -13,7 +13,10 @@ import (
 )
 
 // Perft counts leaf nodes at the given depth by brute-force recursion
-// over legal moves. depth 0 returns 1 (the position itself).
+// over legal moves. depth 0 returns 1 (the position itself). Walks
+// via make/unmake on b itself: b is back to exactly how it started by
+// the time this returns, so callers can keep using the same board
+// they passed in.
 func Perft(b *board.Board, depth int) uint64 {
 	if depth == 0 {
 		return 1
@@ -25,7 +28,9 @@ func Perft(b *board.Board, depth int) uint64 {
 
 	var nodes uint64
 	for _, m := range moves {
-		nodes += Perft(b.MakeMove(m), depth-1)
+		undo := b.MakeMove(m)
+		nodes += Perft(b, depth-1)
+		b.UnmakeMove(m, undo)
 	}
 	return nodes
 }
@@ -41,7 +46,9 @@ func Divide(b *board.Board, depth int) map[string]uint64 {
 		return result
 	}
 	for _, m := range movegen.GenerateLegalMoves(b) {
-		result[m.String()] = Perft(b.MakeMove(m), depth-1)
+		undo := b.MakeMove(m)
+		result[m.String()] = Perft(b, depth-1)
+		b.UnmakeMove(m, undo)
 	}
 	return result
 }
@@ -69,7 +76,10 @@ func VerifyHashes(b *board.Board, depth int) string {
 		return ""
 	}
 	for _, m := range movegen.GenerateLegalMoves(b) {
-		if fen := VerifyHashes(b.MakeMove(m), depth-1); fen != "" {
+		undo := b.MakeMove(m)
+		fen := VerifyHashes(b, depth-1)
+		b.UnmakeMove(m, undo)
+		if fen != "" {
 			return fen
 		}
 	}

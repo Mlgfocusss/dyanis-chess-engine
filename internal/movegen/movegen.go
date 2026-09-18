@@ -32,12 +32,19 @@ func onBoard(file, rank int) bool {
 func GenerateLegalMoves(b *board.Board) []board.Move {
 	pseudo := generatePseudoLegalMoves(b)
 	legal := make([]board.Move, 0, len(pseudo))
+	us := b.SideToMove
 
 	for _, m := range pseudo {
-		next := b.MakeMove(m)
-		if !IsSquareAttacked(next, next.KingSquare(b.SideToMove), next.SideToMove) {
+		undo := b.MakeMove(m)
+		// b.SideToMove is now the opponent (MakeMove just flipped it),
+		// which is exactly the "attacked by" side this check needs —
+		// after making our own move, is OUR king (found via KingSquare
+		// for the side that was to move before this loop started, not
+		// b.SideToMove now) under attack from them?
+		if !IsSquareAttacked(b, b.KingSquare(us), b.SideToMove) {
 			legal = append(legal, m)
 		}
+		b.UnmakeMove(m, undo)
 	}
 	return legal
 }

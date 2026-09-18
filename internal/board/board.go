@@ -188,6 +188,27 @@ type Board struct {
 	// computeHashFromScratch; Copy() carries it along automatically
 	// since it's a plain uint64 field, not a pointer or slice.
 	hash uint64
+
+	// kingSq caches each side's king square (kingSq[White], kingSq[Black])
+	// so KingSquare doesn't have to linear-scan all 64 squares on every
+	// call — profiling showed that scan was a real cost, since
+	// KingSquare is called once per pseudo-legal candidate move inside
+	// GenerateLegalMoves' king-safety filter, i.e. very often. Kept in
+	// sync by MakeMove/UnmakeMove whenever the moved piece is a king
+	// (see move.go); MakeNullMove/UnmakeNullMove never move a piece, so
+	// they don't touch this. Copy() carries it along automatically,
+	// same as hash.
+	//
+	// NOT trusted blindly, though: a Board built via a raw struct
+	// literal (several tests do this — set up Squares directly without
+	// going through NewInitialBoard/FromFEN) leaves this at its zero
+	// value, Square(0) = a1, which is not NoSquare and could easily be
+	// wrong. KingSquare() verifies the cached square still actually
+	// holds that color's king before trusting it, and falls back to
+	// the old full-scan (self-healing the cache for next time) if not
+	// — so this is a pure performance cache, never a correctness
+	// requirement on how a Board gets built.
+	kingSq [2]Square
 }
 
 // NewInitialBoard returns the standard starting position.
@@ -207,14 +228,19 @@ func NewInitialBoard() *Board {
 		b.Squares[MakeSquare(file, 6)] = MakePiece(Pawn, Black)
 		b.Squares[MakeSquare(file, 7)] = MakePiece(backRank[file], Black)
 	}
+	b.kingSq[White] = MakeSquare(4, 0) // e1
+	b.kingSq[Black] = MakeSquare(4, 7) // e8
 	b.hash = b.computeHashFromScratch()
 	return b
 }
 
-// Copy returns a deep copy of the board. Move generation works on
-// copies for now (make-move-on-copy rather than make/unmake with undo)
-// for simplicity; this can be optimized later once correctness is
-// established via perft tests.
+// Copy returns a deep copy of the board. No longer used by move
+// generation or search — those now mutate the board in place via
+// MakeMove/UnmakeMove (see move.go) instead of allocating a fresh
+// Board per move. Still useful wherever a throwaway branch is wanted
+// without having to track an Undo to unwind it, e.g. search.go's
+// principalVariation, which walks a line forward purely to read it and
+// has no matching "unmake" step to run.
 func (b *Board) Copy() *Board {
 	nb := *b
 	return &nb
@@ -225,12 +251,24 @@ func (b *Board) PieceAt(sq Square) Piece {
 	return b.Squares[sq]
 }
 
-// KingSquare finds the square of the given color's king.
-// Returns NoSquare if not found (should not happen in a legal position).
+// KingSquare finds the square of the given color's king. Returns
+// NoSquare if that color genuinely has no king on the board.
+//
+// Fast path: trusts the kingSq cache (see Board's doc comment) if the
+// square it points to still actually holds that color's king — O(1),
+// no scan. Slow path, for a Board whose cache is stale or was never
+// set (built via a raw struct literal rather than NewInitialBoard/
+// FromFEN): falls back to the original full 64-square scan, and heals
+// the cache with whatever it finds so subsequent calls on this same
+// Board take the fast path.
 func (b *Board) KingSquare(c Color) Square {
-	target := MakePiece(King, c)
+	want := MakePiece(King, c)
+	if sq := b.kingSq[c]; sq != NoSquare && b.Squares[sq] == want {
+		return sq
+	}
 	for sq := Square(0); sq < 64; sq++ {
-		if b.Squares[sq] == target {
+		if b.Squares[sq] == want {
+			b.kingSq[c] = sq
 			return sq
 		}
 	}

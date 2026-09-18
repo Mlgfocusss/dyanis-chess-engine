@@ -119,13 +119,18 @@ func disambiguate(before *board.Board, m board.Move, pieceType board.PieceType) 
 	return m.From.String()
 }
 
-// checkSuffix plays m on a copy of before and reports "#" if that
-// checkmates the opponent, "+" if it merely checks them, or "" if
-// neither — reusing GameStatus/InCheck rather than re-deriving check
-// detection, since those are already the perft-verified source of
-// truth for "is this king attacked / is this checkmate".
+// checkSuffix plays m on a disposable copy of before and reports "#"
+// if that checkmates the opponent, "+" if it merely checks them, or
+// "" if neither — reusing GameStatus/InCheck rather than re-deriving
+// check detection, since those are already the perft-verified source
+// of truth for "is this king attacked / is this checkmate". A copy is
+// used (rather than MakeMove+UnmakeMove on before itself) because
+// before is the caller's actual position — often the live game state
+// SAN is being generated for on the fly — and must come out of this
+// function unmodified.
 func checkSuffix(before *board.Board, m board.Move) string {
-	after := before.MakeMove(m)
+	after := before.Copy()
+	after.MakeMove(m)
 	switch GameStatus(after) {
 	case Checkmate:
 		return "#"

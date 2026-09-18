@@ -26,7 +26,8 @@ func TestEnPassantCapture(t *testing.T) {
 		tt, _ := board.ParseSquare(to)
 		for _, m := range GenerateLegalMoves(b) {
 			if m.From == f && m.To == tt {
-				return b.MakeMove(m)
+				b.MakeMove(m)
+				return b
 			}
 		}
 		t.Fatalf("move %s-%s not found as legal", from, to)
