@@ -9,17 +9,8 @@ import "github.com/yourname/dyanis-chess-engine/internal/board"
 const bishopPairBonus = 30
 
 func bishopPairScore(b *board.Board) int {
-	white, black := 0, 0
-	for _, p := range b.Squares {
-		if p.Type() != board.Bishop {
-			continue
-		}
-		if p.Color() == board.White {
-			white++
-		} else {
-			black++
-		}
-	}
+	white := b.Pieces(board.Bishop, board.White).Count()
+	black := b.Pieces(board.Bishop, board.Black).Count()
 
 	score := 0
 	if white >= 2 {

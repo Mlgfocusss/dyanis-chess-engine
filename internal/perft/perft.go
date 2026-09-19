@@ -85,3 +85,34 @@ func VerifyHashes(b *board.Board, depth int) string {
 	}
 	return ""
 }
+
+// VerifyBitboards is VerifyHashes' exact counterpart for the
+// incremental bitboard bookkeeping added to MakeMove/UnmakeMove
+// alongside the hash (see internal/board/move.go, internal/board/
+// bitboard.go): same recursive walk over the legal-move tree, same
+// per-node check (board.Board.VerifyBitboards() instead of
+// VerifyHash()), same "first offending FEN, or empty string if none"
+// contract. Deliberately a second, separate top-to-bottom walk rather
+// than folding this check into VerifyHashes' existing traversal — the
+// two are checking unrelated pieces of incremental state (Zobrist hash
+// vs. bitboard snapshot) maintained by different lines of MakeMove,
+// and keeping them as two independent walks means a bug that trips
+// one doesn't obscure whether the other is also broken at the same
+// node.
+func VerifyBitboards(b *board.Board, depth int) string {
+	if !b.VerifyBitboards() {
+		return b.ToFEN()
+	}
+	if depth == 0 {
+		return ""
+	}
+	for _, m := range movegen.GenerateLegalMoves(b) {
+		undo := b.MakeMove(m)
+		fen := VerifyBitboards(b, depth-1)
+		b.UnmakeMove(m, undo)
+		if fen != "" {
+			return fen
+		}
+	}
+	return ""
+}

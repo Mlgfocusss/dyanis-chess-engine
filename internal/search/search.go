@@ -37,7 +37,6 @@ package search
 import (
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/yourname/dyanis-chess-engine/internal/board"
@@ -130,6 +129,7 @@ const (
 )
 
 type ttEntry struct {
+	key   uint64 // full Zobrist hash this slot currently holds — see probe's comment for why this is needed once lookup is by hash&ttMask, not by the hash itself
 	depth int
 	score int
 	bound bound
@@ -143,12 +143,25 @@ type ttEntry struct {
 // sibling position), without the bookkeeping of a longer list.
 const killerSlots = 2
 
-// historyKey identifies a quiet move for the history heuristic by
-// from/to squares alone (not piece type or flags) — same convention
-// TT's own move-equality checks already rely on implicitly via
-// board.Move's == comparisons.
-type historyKey struct {
-	From, To board.Square
+// ttSize is the transposition table's slot count — a fixed power of
+// two so hash&ttMask (below) is a plain bitwise AND instead of a
+// modulo. 1<<20 (~1M slots, ~32MB at ttEntry's current size) is a
+// reasonable default for this project's current search depths; not
+// exposed as a constructor parameter yet, simply to avoid touching
+// every existing NewTranspositionTable() call site (BestMove,
+// BestMoveTimed, every test, uci.go) for a knob nothing currently
+// needs tuned.
+const ttSize = 1 << 20
+const ttMask = ttSize - 1
+
+// historySize covers every possible (From, To) square pair the
+// history heuristic indexes by — 64*64, dense enough that a flat
+// array beats a map outright: no hashing, no bucket probing, and the
+// whole table is a trivial 64*64*8 = 32KB.
+const historySize = 64 * 64
+
+func historyIndex(from, to board.Square) int {
+	return int(from)*64 + int(to)
 }
 
 // TranspositionTable caches negamax results by position hash, so a
@@ -158,29 +171,52 @@ type historyKey struct {
 // at the next, deeper iteration — a good first move is what lets
 // alpha-beta actually prune effectively.
 //
-// Implementation: a plain Go map keyed by the full 64-bit Zobrist
-// hash. That's simpler than the fixed-size array + replacement-scheme
-// approach faster engines use, at the cost of unbounded memory growth
-// over a long search — acceptable for this project's current depths,
-// worth revisiting (fixed-size table, always-replace or depth-
-// preferred replacement) if that ever becomes a real problem.
+// Implementation: a fixed-size array (entries), indexed by
+// hash&ttMask rather than keyed by the hash directly the way a map
+// would be — replacing an earlier plain-map version once profiling
+// showed map access (hashing + bucket probing) as a real, measurable
+// chunk of total search time (see TECHNICAL.md's profiling notes).
+// Slot count is much smaller than the 64-bit hash space, so two
+// different positions can legitimately want the same slot — probe/
+// store below handle that by storing the full hash alongside each
+// entry and checking it, treating a slot that holds a DIFFERENT
+// position's data as a miss rather than a wrong answer. Replacement
+// is depth-preferred (see store's own comment): a deeper existing
+// entry for a different position survives a shallower write rather
+// than being evicted by it, since it took more search effort to
+// produce and is more likely to still be useful later — a fresh
+// result for the SAME position always overwrites regardless of
+// depth, and an empty slot always accepts a write. Unlike the map,
+// this has a fixed memory footprint that doesn't grow across a long
+// search — a real improvement, not just a speed one.
 //
-// killers and history also live here, even though neither is a
-// position cache: a TranspositionTable is already the one piece of
-// state threaded through an entire top-level search call (BestMove/
-// BestMoveTimed each construct a fresh one), which is exactly the
-// scope both move-ordering aids need — reset between unrelated
-// searches, shared across every node and every iterative-deepening
-// pass within one search. killers is indexed by *remaining* depth
-// rather than absolute ply from the root, which conflates killers
-// from different lines that happen to reach the same remaining depth
-// — a known simplification (see negamax's move-ordering comment)
-// rather than the more precise but more bookkeeping-heavy per-ply
-// version.
+// history is the same story: a flat array indexed by historyIndex
+// instead of a map keyed by (From, To), for the same reason.
+//
+// killers also lives here, even though it's neither of the above: a
+// TranspositionTable is already the one piece of state threaded
+// through an entire top-level search call (BestMove/BestMoveTimed
+// each construct a fresh one), which is exactly the scope both move-
+// ordering aids need — reset between unrelated searches, shared
+// across every node and every iterative-deepening pass within one
+// search. killers is indexed by *remaining* depth rather than
+// absolute ply from the root, which conflates killers from different
+// lines that happen to reach the same remaining depth — a known
+// simplification (see negamax's move-ordering comment) rather than
+// the more precise but more bookkeeping-heavy per-ply version.
 type TranspositionTable struct {
-	entries map[uint64]ttEntry
+	entries []ttEntry
 	killers [][killerSlots]board.Move
-	history map[historyKey]int
+	history []int
+
+	// pawnCache is eval.Evaluate's per-search pawn-structure cache —
+	// see eval.PawnCache's own doc comment for what it caches and why
+	// it lives here (one per top-level search call) rather than as a
+	// package-level global in eval: a global would need a mutex the
+	// moment this engine's search becomes multi-threaded, or worse,
+	// silently leak one search's cached scores into a different,
+	// concurrent one.
+	pawnCache *eval.PawnCache
 
 	// nodes counts every negamax/quiescenceSearch call made using this
 	// table, across however many iterative-deepening passes share it —
@@ -196,9 +232,63 @@ type TranspositionTable struct {
 // NewTranspositionTable returns an empty table.
 func NewTranspositionTable() *TranspositionTable {
 	return &TranspositionTable{
-		entries: make(map[uint64]ttEntry),
-		history: make(map[historyKey]int),
+		entries:   make([]ttEntry, ttSize),
+		history:   make([]int, historySize),
+		pawnCache: eval.NewPawnCache(),
 	}
+}
+
+// pawnCacheOrNil safely fetches tt's pawn cache whether tt itself is a
+// real table or nil — negamax/quiescenceSearch are both callable with
+// a nil *TranspositionTable (see TestNegamaxNilTableStillWorks), and
+// calling a pointer-receiver method on a nil receiver is fine in Go as
+// long as the method itself checks for nil before dereferencing,
+// which this does.
+func (tt *TranspositionTable) pawnCacheOrNil() *eval.PawnCache {
+	if tt == nil {
+		return nil
+	}
+	return tt.pawnCache
+}
+
+// probe looks up hash's slot and reports whether it currently holds
+// THIS exact position — not just any position that happens to share
+// the same slot (hash&ttMask maps the full 64-bit hash space down to
+// ttSize slots, so collisions between entirely unrelated positions
+// are expected and must be detected, not silently treated as a hit).
+// A slot's zero value (key 0) doubles as "never written" — a real
+// position hashing to exactly 0 is astronomically unlikely (1 in
+// 2^64) and, worst case, only costs that one lookup a spurious miss,
+// never a wrong answer.
+func (tt *TranspositionTable) probe(hash uint64) (ttEntry, bool) {
+	e := tt.entries[hash&ttMask]
+	if e.key != hash {
+		return ttEntry{}, false
+	}
+	return e, true
+}
+
+// store writes e into hash's slot, unconditionally overwriting
+// whatever (if anything) was there before — see the type's own doc
+// comment for why "always replace" rather than a fancier scheme.
+// store writes e into hash's slot — unless a DIFFERENT position
+// already sits there with a greater search depth, in which case that
+// existing entry is worth more (took more work to produce, and is
+// more likely to still be useful later) and is kept instead. A fresh
+// result for the SAME position (old.key == hash) always overwrites
+// regardless of depth — that's just newer information about the exact
+// position already in the slot, not a shallower position trying to
+// evict a deeper one. An empty slot (old.key == 0, see probe's own
+// comment on that sentinel) always accepts the write too, having
+// nothing to compare against.
+func (tt *TranspositionTable) store(hash uint64, e ttEntry) {
+	idx := hash & ttMask
+	old := tt.entries[idx]
+	if old.key != 0 && old.key != hash && old.depth > e.depth {
+		return
+	}
+	e.key = hash
+	tt.entries[idx] = e
 }
 
 // killersAt returns the killer-move slots for a given remaining
@@ -234,11 +324,11 @@ func (tt *TranspositionTable) recordKiller(depth int, m board.Move) {
 // which has been strong in many different positions during this
 // search is a reasonable one to try early in a new position too.
 func (tt *TranspositionTable) recordHistory(m board.Move, depth int) {
-	tt.history[historyKey{m.From, m.To}] += depth * depth
+	tt.history[historyIndex(m.From, m.To)] += depth * depth
 }
 
 func (tt *TranspositionTable) historyScore(m board.Move) int {
-	return tt.history[historyKey{m.From, m.To}]
+	return tt.history[historyIndex(m.From, m.To)]
 }
 
 // --- Search -----------------------------------------------------------
@@ -338,7 +428,7 @@ func principalVariation(b *board.Board, tt *TranspositionTable, maxLen int) []bo
 		}
 		seen[hash] = true
 
-		entry, ok := tt.entries[hash]
+		entry, ok := tt.probe(hash)
 		if !ok || !isLegalMove(cur, entry.move) {
 			break
 		}
@@ -375,7 +465,7 @@ func BestMoveInfo(b *board.Board, depth int, onInfo func(SearchInfo)) (board.Mov
 		return board.Move{}, errors.New("search.BestMove: no legal moves in this position")
 	}
 	tt := NewTranspositionTable()
-	score, bestMove := negamax(b, depth, 0, -Infinity, Infinity, true, tt)
+	score, bestMove := negamax(b, depth, 0, -Infinity, Infinity, true, tt, maxSearchCheckExtensions)
 	if onInfo != nil {
 		onInfo(SearchInfo{Depth: depth, Score: score, PV: principalVariation(b, tt, depth), Nodes: tt.nodes})
 	}
@@ -453,14 +543,14 @@ func BestMoveTimedInfo(b *board.Board, maxDepth int, budget time.Duration, onInf
 			alpha, beta = prevScore-aspirationDelta, prevScore+aspirationDelta
 		}
 
-		score, m := negamax(b, depth, 0, alpha, beta, true, tt)
+		score, m := negamax(b, depth, 0, alpha, beta, true, tt, maxSearchCheckExtensions)
 		if score <= alpha || score >= beta {
 			// Fail-low or fail-high: the narrow window didn't contain
 			// the true score, so the move/score above can't be
 			// trusted as-is. Re-search this same depth with the full
 			// window rather than either widening incrementally or
 			// silently accepting a bound as if it were exact.
-			score, m = negamax(b, depth, 0, -Infinity, Infinity, true, tt)
+			score, m = negamax(b, depth, 0, -Infinity, Infinity, true, tt, maxSearchCheckExtensions)
 		}
 
 		bestMove = m
@@ -508,6 +598,24 @@ const lmrFullDepthMoves = 4
 // move reliably still beats alpha at the reduced depth and triggers
 // the full-depth re-search below rather than getting missed outright.
 const lmrReduction = 1
+
+// futilityMaxDepth is the deepest remaining depth futility pruning
+// bothers attempting at — beyond this, too many plies remain for a
+// static snapshot plus a fixed margin to say anything reliable about
+// whether a quiet move could still matter; only very close to the
+// leaves does "even a generous swing can't reach alpha" become a
+// trustworthy signal.
+const futilityMaxDepth = 3
+
+// futilityMargin[depth] is how many centipawns of swing a quiet move
+// is given the benefit of the doubt for, at that many plies of
+// remaining depth, before being judged futile. Index 0 is never used
+// (depth 0 hands off to quiescence before the move loop this applies
+// in is ever reached) — indices 1..futilityMaxDepth roughly track "a
+// deeper remaining search has more room to still turn things around,
+// so it earns a wider margin," on the same centipawn scale eval.go's
+// own piece values use (a pawn is 100).
+var futilityMargin = [futilityMaxDepth + 1]int{0, 150, 300, 500}
 
 // hasNonPawnMaterial reports whether color c has any piece besides
 // pawns and the king — the standard null-move pruning guard against
@@ -559,7 +667,26 @@ func hasNonPawnMaterial(b *board.Board, c board.Color) bool {
 // null-move probe). It exists purely for mate-distance adjustment —
 // see MateScore's comment and storeAdjustMateScore/
 // readAdjustMateScore above — and plays no other role in the search.
-func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *TranspositionTable) (score int, bestMove board.Move) {
+// maxSearchCheckExtensions bounds how many plies of "search one ply
+// deeper because this move gives check" can stack up along any single
+// line — the main-search counterpart to quiescence's own
+// maxQuiescenceCheckExtensions (see its comment below), same
+// reasoning: a position with a long forcing sequence of checks (a
+// king hunt, a perpetual-check line) could otherwise keep extending
+// indefinitely, since each check along the way looks individually
+// worth resolving fully rather than cutting off at the horizon. A
+// budget threaded through the recursion, decremented only when an
+// extension actually fires, caps the total worst case without
+// disabling the technique on ordinary, short forcing sequences (a
+// two- or three-move mating net, a check that wins material) — which
+// is exactly the case check extensions exist for: negamax otherwise
+// has no way to tell "the search happened to stop right before this
+// forced sequence resolved" apart from "this position is genuinely
+// fine," and can misjudge a position specifically because the horizon
+// landed mid-check.
+const maxSearchCheckExtensions = 6
+
+func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *TranspositionTable, checkExtLeft int) (score int, bestMove board.Move) {
 	if tt != nil {
 		tt.nodes++
 	}
@@ -567,7 +694,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 	var hash uint64
 	if tt != nil {
 		hash = b.Hash()
-		if entry, ok := tt.entries[hash]; ok && entry.depth >= depth {
+		if entry, ok := tt.probe(hash); ok && entry.depth >= depth {
 			adjustedScore := readAdjustMateScore(entry.score, ply)
 			switch entry.bound {
 			case exactBound:
@@ -647,7 +774,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 	if !isRoot && depth >= nullMoveMinDepth && beta < MateScore &&
 		!inCheck && hasNonPawnMaterial(b, b.SideToMove) {
 		nullUndo := b.MakeNullMove()
-		nullScore, _ := negamax(b, depth-1-nullMoveReduction, ply+1, -beta, -beta+1, false, tt)
+		nullScore, _ := negamax(b, depth-1-nullMoveReduction, ply+1, -beta, -beta+1, false, tt, checkExtLeft)
 		nullScore = -nullScore
 		b.UnmakeNullMove(nullUndo)
 		if nullScore >= beta {
@@ -666,7 +793,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 	var ttMove board.Move
 	hasTTMove := false
 	if tt != nil {
-		if entry, ok := tt.entries[hash]; ok {
+		if entry, ok := tt.probe(hash); ok {
 			ttMove, hasTTMove = entry.move, true
 		}
 	}
@@ -675,8 +802,64 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 	best := -Infinity
 	bestHere := moves[0] // GameStatusFromMoves above already ruled out the empty-moves case
 
+	// Futility pruning setup: applicable at all only away from the
+	// root (a root move can never be skipped — BestMove needs a real
+	// move back), away from check (every reply is forced/critical
+	// there, the same reasoning NMP/LMR's own !inCheck guards use),
+	// shallow enough remaining depth, and away from mate-score bounds
+	// (a static snapshot has nothing meaningful to say about a
+	// position whose value IS a forced-mate distance). staticEval is
+	// computed at most once per node, only when actually needed, not
+	// once per candidate move.
+	futilityApplies := !isRoot && !inCheck && depth <= futilityMaxDepth &&
+		alpha > -MateScore && beta < MateScore
+	var staticEval int
+	if futilityApplies {
+		staticEval = eval.Evaluate(b, tt.pawnCacheOrNil())
+	}
+
 	for i, m := range moves {
 		undo := b.MakeMove(m)
+
+		// givesCheck: does THIS move put the opponent in check? Cheap
+		// (movegen.InCheck is an O(1) magic-bitboard lookup, not a
+		// scan), and used for three things below: futility pruning's
+		// per-move guard, excluding the move from LMR (a check is
+		// forcing, not a "probably safe to search shallowly" quiet
+		// move — see reduceEligible), and extending the depth passed
+		// to whichever recursive call actually searches it, budget
+		// permitting.
+		givesCheck := movegen.InCheck(b)
+
+		// Futility pruning: a quiet move whose best-case swing (the
+		// node's static eval plus a generous per-ply margin) still
+		// can't reach alpha has essentially no realistic chance of
+		// mattering this close to the leaves — skip it without ever
+		// searching it, not even a reduced probe. i > 0 excludes the
+		// move ordering has bet everything on being best here (the
+		// same conservatism PVS/LMR already give that move elsewhere
+		// in this loop) — futility only ever prunes a LATER
+		// candidate, never the presumed-best one. Captures and
+		// promotions are excluded (their value isn't something a
+		// static snapshot judges), and so are check-giving moves
+		// (forcing, not "probably safe to skip" — same exclusion
+		// reduceEligible makes just below).
+		if futilityApplies && i > 0 && !givesCheck && !m.IsCapture() &&
+			m.Flag != board.Promotion && m.Flag != board.PromotionCapture &&
+			staticEval+futilityMargin[depth] <= alpha {
+			b.UnmakeMove(m, undo)
+			continue
+		}
+
+		extend := 0
+		if givesCheck && checkExtLeft > 0 {
+			extend = 1
+		}
+		childCheckExtLeft := checkExtLeft
+		if extend > 0 {
+			childCheckExtLeft--
+		}
+		childDepth := depth - 1 + extend
 
 		// Late Move Reductions guard: move ordering has already put
 		// its best guesses (TT move, captures by MVV-LVA, killers,
@@ -685,10 +868,12 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 		// the best one here, so its FIRST probe (see below) is done a
 		// few plies shallower than normal. Captures and promotions are
 		// excluded (their tactical value isn't something a
-		// reduced-depth glance reliably judges), and the whole thing
-		// is skipped while in check, same reasoning as null-move
+		// reduced-depth glance reliably judges), moves that give check
+		// are excluded for the same reason (forcing, not "probably
+		// safe to skip or search shallowly"), and the whole thing is
+		// skipped while already in check, same reasoning as null-move
 		// pruning's guard above.
-		reduceEligible := !inCheck &&
+		reduceEligible := !inCheck && !givesCheck &&
 			depth >= lmrMinDepth &&
 			i >= lmrFullDepthMoves &&
 			!m.IsCapture() &&
@@ -703,7 +888,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 			// probe/re-search dance below exists to cheaply REJECT
 			// moves that don't beat alpha, and this move is expected
 			// to set alpha, not merely clear it.
-			childScore, _ := negamax(b, depth-1, ply+1, -beta, -alpha, false, tt)
+			childScore, _ := negamax(b, childDepth, ply+1, -beta, -alpha, false, tt, childCheckExtLeft)
 			s = -childScore
 		} else {
 			// Every later move: a cheap null-window probe first — a
@@ -715,11 +900,11 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 			// probe that fails to beat alpha at reduced depth almost
 			// always also fails at full depth, so most late quiet
 			// moves get rejected without ever running at full depth.
-			searchDepth := depth - 1
+			searchDepth := childDepth
 			if reduceEligible {
 				searchDepth = depth - 1 - lmrReduction
 			}
-			probeScore, _ := negamax(b, searchDepth, ply+1, -alpha-1, -alpha, false, tt)
+			probeScore, _ := negamax(b, searchDepth, ply+1, -alpha-1, -alpha, false, tt, childCheckExtLeft)
 			s = -probeScore
 
 			if reduceEligible && s > alpha {
@@ -728,7 +913,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 				// real signal. Re-confirm with the same cheap null
 				// window at full depth before paying for a
 				// full-window search.
-				probeScore, _ = negamax(b, depth-1, ply+1, -alpha-1, -alpha, false, tt)
+				probeScore, _ = negamax(b, childDepth, ply+1, -alpha-1, -alpha, false, tt, childCheckExtLeft)
 				s = -probeScore
 			}
 
@@ -737,7 +922,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 				// not" — it can't pin down the real score once that's
 				// yes. Only a move that earned it gets the full-
 				// window search that actually establishes its value.
-				fullScore, _ := negamax(b, depth-1, ply+1, -beta, -alpha, false, tt)
+				fullScore, _ := negamax(b, childDepth, ply+1, -beta, -alpha, false, tt, childCheckExtLeft)
 				s = -fullScore
 			}
 		}
@@ -771,7 +956,7 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 		} else if best >= beta {
 			resultBound = lowerBound
 		}
-		tt.entries[hash] = ttEntry{depth: depth, score: storeAdjustMateScore(best, ply), bound: resultBound, move: bestHere}
+		tt.store(hash, ttEntry{depth: depth, score: storeAdjustMateScore(best, ply), bound: resultBound, move: bestHere})
 	}
 
 	return best, bestHere
@@ -874,24 +1059,37 @@ func orderMoves(b *board.Board, moves []board.Move, ttMove board.Move, hasTTMove
 	sortByScore(moves, scores)
 }
 
-// sortByScore sorts moves descending by their parallel scores slice.
-// Sorting a slice of indices and then materializing the result is
-// simpler than trying to make sort.Slice permute two slices in
-// lockstep (its swap only knows about the one slice it's given).
-func sortByScore(moves []board.Move, scores []int) {
-	idx := make([]int, len(moves))
-	for i := range idx {
-		idx[i] = i
+// insertionSortByScoreDesc sorts moves and their parallel scores
+// slice in lockstep, descending by score, directly — replacing
+// sort.Sort over a moveScoreSorter (a concrete sort.Interface; see
+// its own now-removed comment for why that was already better than
+// sort.Slice's reflection-based swap). Move lists in this engine are
+// small — rarely more than a few dozen candidates at any node — well
+// below the size where sort.Sort's pdqsort dispatch (choosePivot,
+// partition, recursion) earns back its own overhead; Go's sort
+// package already falls back to a plain insertion sort internally for
+// small slices (visible as runtime.insertionSort in a profile of the
+// old sort.Sort-based version), so this just skips straight to that,
+// skipping both pdqsort's own bookkeeping AND the Len/Less/Swap
+// interface-method dispatch moveScoreSorter needed to get there.
+func insertionSortByScoreDesc(moves []board.Move, scores []int) {
+	for i := 1; i < len(moves); i++ {
+		m, s := moves[i], scores[i]
+		j := i - 1
+		for j >= 0 && scores[j] < s {
+			moves[j+1] = moves[j]
+			scores[j+1] = scores[j]
+			j--
+		}
+		moves[j+1] = m
+		scores[j+1] = s
 	}
-	sort.Slice(idx, func(i, j int) bool {
-		return scores[idx[i]] > scores[idx[j]]
-	})
+}
 
-	ordered := make([]board.Move, len(moves))
-	for i, j := range idx {
-		ordered[i] = moves[j]
-	}
-	copy(moves, ordered)
+// sortByScore sorts moves descending by their parallel scores slice,
+// in place.
+func sortByScore(moves []board.Move, scores []int) {
+	insertionSortByScoreDesc(moves, scores)
 }
 
 // --- Quiescence search -------------------------------------------------
@@ -925,71 +1123,128 @@ func quiescenceSearch(b *board.Board, ply, alpha, beta, checkExtLeft int, tt *Tr
 		tt.nodes++
 	}
 	inCheck := movegen.InCheck(b)
-	legal := movegen.GenerateLegalMoves(b)
 
-	if len(legal) == 0 {
-		if inCheck {
+	// In check: every legal reply matters (block, capture, king move,
+	// and — critically — "none of the above" means checkmate), so
+	// this path still needs the full legal-move list, same as before
+	// this function was split. Checks are the minority of quiescence
+	// nodes; this is not the path the GenerateLegalCaptures change
+	// below is aimed at.
+	if inCheck {
+		legal := movegen.GenerateLegalMoves(b)
+		if len(legal) == 0 {
 			return ply - MateScore
 		}
-		return 0 // stalemate
-	}
-	if b.HalfmoveClock >= 100 || movegen.InsufficientMaterial(b) {
-		return 0 // draw by 50-move rule or insufficient material — same
-		// reasoning as negamax's GameStatus check: quiescence must not
-		// walk past a boundary that's already a rules draw while
-		// chasing a capture sequence, regardless of how "won" the
-		// material looks.
+		if b.HalfmoveClock >= 100 || movegen.InsufficientMaterial(b) {
+			return 0
+		}
+
+		extendForCheck := checkExtLeft > 0
+		var candidates []board.Move
+		if extendForCheck {
+			candidates = legal
+		} else {
+			// Check-extension budget spent: degrade to the same
+			// captures-only handling the not-in-check path below uses,
+			// filtered from the legal list already in hand (no second
+			// generation needed — legal was already the full list).
+			standPat := eval.Evaluate(b, tt.pawnCacheOrNil())
+			if standPat >= beta {
+				return beta
+			}
+			if standPat > alpha {
+				alpha = standPat
+			}
+			for _, m := range legal {
+				if m.IsCapture() && SEE(b, m) >= 0 {
+					candidates = append(candidates, m)
+				}
+			}
+			sortCandidatesBySEE(b, candidates)
+		}
+
+		nextCheckExtLeft := checkExtLeft
+		if extendForCheck {
+			nextCheckExtLeft--
+		}
+		return quiescenceLoop(b, ply, alpha, beta, nextCheckExtLeft, candidates, tt)
 	}
 
-	// extendForCheck: while in check, there's no "standing pat" —
-	// every legal reply (block, capture, king move) has to be
-	// considered, not just captures, since being in check is itself
-	// the noise quiescence exists to search through. Once the
-	// check-extension budget is spent, this degrades to the normal
-	// captures-only handling below even if still in check — a
-	// pragmatic cap, not a fully sound one (see the const's comment).
-	extendForCheck := inCheck && checkExtLeft > 0
+	// Not in check — the overwhelming majority of quiescence nodes.
+	// GenerateLegalCaptures (movegen.go) generates only captures
+	// straight from bitboards, skipping the quiet-move generation
+	// GenerateLegalMoves would otherwise do for no benefit here (the
+	// standPat/SEE>=0 filtering immediately below only ever keeps
+	// captures anyway). This used to be a measured hot spot —
+	// quiescence nodes vastly outnumber ordinary search nodes, so
+	// paying full move-generation cost on every one of them was a
+	// large fraction of total search time (see TECHNICAL.md).
+	//
+	// Trade-off, deliberate: this does NOT distinguish "no captures,
+	// but other legal moves exist" from "actually stalemate, zero
+	// legal moves at all" the way the len(legal)==0 check above does
+	// for the in-check path — a stalemate landing exactly on a
+	// not-in-check quiescence node (already a rare event this deep in
+	// a search) falls through to standPat below instead of the
+	// correct 0. negamax's own GameStatusFromMoves check at every real
+	// search node remains the authoritative, fully-correct terminal
+	// detection; this only affects the leaf value quiescence falls
+	// back to on the rare position that happens to be stalemate.
+	if b.HalfmoveClock >= 100 || movegen.InsufficientMaterial(b) {
+		return 0
+	}
+
+	standPat := eval.Evaluate(b, tt.pawnCacheOrNil())
+	if standPat >= beta {
+		return beta
+	}
+	if standPat > alpha {
+		alpha = standPat
+	}
 
 	var candidates []board.Move
-	if extendForCheck {
-		candidates = legal
-	} else {
-		// standPat: the static evaluation of just... not capturing
-		// anything here. A player is never forced to capture, so this
-		// is a valid lower bound on the position's value — if simply
-		// stopping here is already good enough to cause a beta
-		// cutoff, there's no need to look at any capture at all.
-		standPat := eval.Evaluate(b)
-		if standPat >= beta {
-			return beta
+	for _, m := range movegen.GenerateLegalCaptures(b) {
+		if SEE(b, m) >= 0 {
+			candidates = append(candidates, m)
 		}
-		if standPat > alpha {
-			alpha = standPat
-		}
-		for _, m := range legal {
-			if m.IsCapture() && SEE(b, m) >= 0 {
-				candidates = append(candidates, m)
-			}
-		}
-		// Sort by SEE itself, not MVV-LVA: MVV-LVA is a cheap PROXY
-		// for "which capture is probably good" (biggest victim, cheapest
-		// attacker) that breaks down on defended pieces — pawn-takes-
-		// defended-queen ranks above knight-takes-hanging-rook under
-		// MVV-LVA even though the queen capture nets nothing once the
-		// recapture is accounted for. SEE already computed the real
-		// number for every candidate just above (to decide whether to
-		// keep it at all), so sorting by that same number costs nothing
-		// extra and orders captures by their actual expected outcome.
-		sort.Slice(candidates, func(i, j int) bool {
-			return SEE(b, candidates[i]) > SEE(b, candidates[j])
-		})
 	}
+	sortCandidatesBySEE(b, candidates)
 
-	nextCheckExtLeft := checkExtLeft
-	if extendForCheck {
-		nextCheckExtLeft--
+	return quiescenceLoop(b, ply, alpha, beta, checkExtLeft, candidates, tt)
+}
+
+// sortCandidatesBySEE sorts capture candidates by their real SEE
+// value, descending — not MVV-LVA: MVV-LVA is a cheap PROXY for
+// "which capture is probably good" (biggest victim, cheapest
+// attacker) that breaks down on defended pieces — pawn-takes-
+// defended-queen ranks above knight-takes-hanging-rook under MVV-LVA
+// even though the queen capture nets nothing once the recapture is
+// accounted for.
+//
+// SEE is computed exactly once per candidate, into seeValues, rather
+// than inside the sort comparator: sort.Slice's Less gets called
+// roughly O(n log n) times, and SEE isn't a cheap lookup — it
+// simulates the full capture exchange (leastValuableAttacker scans
+// the target square repeatedly as pieces get removed). Computing it
+// once per candidate up front and sorting the cached values via
+// insertionSortByScoreDesc (see sortByScore's comment for why that's
+// preferred over sort.Sort/sort.Slice at this list size) turns that
+// back into O(n) SEE calls.
+func sortCandidatesBySEE(b *board.Board, candidates []board.Move) {
+	if len(candidates) < 2 {
+		return
 	}
+	seeValues := make([]int, len(candidates))
+	for i, m := range candidates {
+		seeValues[i] = SEE(b, m)
+	}
+	insertionSortByScoreDesc(candidates, seeValues)
+}
 
+// quiescenceLoop is quiescenceSearch's shared move-trying loop —
+// standard negamax-style alpha-beta over whatever candidate list the
+// caller (in-check or not-in-check path above) already built.
+func quiescenceLoop(b *board.Board, ply, alpha, beta, nextCheckExtLeft int, candidates []board.Move, tt *TranspositionTable) int {
 	for _, m := range candidates {
 		undo := b.MakeMove(m)
 		score := -quiescenceSearch(b, ply+1, -beta, -alpha, nextCheckExtLeft, tt)
@@ -1001,6 +1256,5 @@ func quiescenceSearch(b *board.Board, ply, alpha, beta, checkExtLeft int, tt *Tr
 			alpha = score
 		}
 	}
-
 	return alpha
 }

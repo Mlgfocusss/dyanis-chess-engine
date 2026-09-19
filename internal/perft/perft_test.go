@@ -42,3 +42,28 @@ func TestIncrementalHashMatchesFromScratch_Kiwipete(t *testing.T) {
 		t.Fatalf("incremental hash (MakeMove) disagrees with a from-scratch recomputation at: %s", fen)
 	}
 }
+
+// The two tests below are VerifyHashes' exact counterpart for the
+// incremental bitboard bookkeeping in MakeMove/UnmakeMove (see
+// internal/board/move.go, internal/board/bitboard.go) — same reason
+// to exist (a missed put/remove/move anywhere in MakeMove would
+// silently corrupt board.Board.bb without changing any move count),
+// same two positions, same depths.
+
+func TestIncrementalBitboardsMatchFromScratch_StartingPosition(t *testing.T) {
+	b := board.NewInitialBoard()
+	if fen := VerifyBitboards(b, 4); fen != "" {
+		t.Fatalf("incremental bitboards (MakeMove) disagree with a from-scratch recomputation at: %s", fen)
+	}
+}
+
+func TestIncrementalBitboardsMatchFromScratch_Kiwipete(t *testing.T) {
+	const kiwipeteFEN = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+	b, err := board.FromFEN(kiwipeteFEN)
+	if err != nil {
+		t.Fatalf("FEN parse failed: %v", err)
+	}
+	if fen := VerifyBitboards(b, 3); fen != "" {
+		t.Fatalf("incremental bitboards (MakeMove) disagree with a from-scratch recomputation at: %s", fen)
+	}
+}

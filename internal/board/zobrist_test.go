@@ -48,9 +48,9 @@ func TestEnPassantOnlyHashedWhenCapturable(t *testing.T) {
 
 	base := func() *Board {
 		b := &Board{SideToMove: White, EnPassant: NoSquare}
-		b.Squares[MakeSquare(4, 6)] = BK // arbitrary kings so the position isn't totally bare
-		b.Squares[MakeSquare(4, 0)] = WK
-		b.Squares[MakeSquare(4, 4)] = BP // the pawn that just double-pushed, sits on e5
+		b.SetSquare(MakeSquare(4, 6), BK) // arbitrary kings so the position isn't totally bare
+		b.SetSquare(MakeSquare(4, 0), WK)
+		b.SetSquare(MakeSquare(4, 4), BP) // the pawn that just double-pushed, sits on e5
 		return b
 	}
 	// seed recomputes b.hash from scratch — needed because these test
@@ -80,7 +80,7 @@ func TestEnPassantOnlyHashedWhenCapturable(t *testing.T) {
 	withCapturer := seed(func() *Board {
 		b := base()
 		b.EnPassant = e6
-		b.Squares[d5] = WP
+		b.SetSquare(d5, WP)
 		return b
 	}())
 

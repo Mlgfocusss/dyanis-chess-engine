@@ -59,19 +59,25 @@ func pieceValue(t board.PieceType) int {
 }
 
 // materialAndPstScore returns material + piece-square value, White
-// minus Black, summed over every piece on the board.
+// minus Black. Almost entirely a single field read: b.MaterialPST()
+// is the incrementally-maintained sum over every piece except the
+// king (see board/material_hook.go — MakeMove/UnmakeMove/SetSquare
+// keep it in sync as pieces move, so nothing here has to rescan the
+// board). Only the king's own term still gets computed fresh on every
+// call, since its value blends between midgame/endgame PSTs based on
+// `phase` — a board-wide quantity that changes on every non-pawn
+// capture or promotion anywhere, not just when the king itself moves,
+// so it can never be folded into that same incremental sum. Still
+// O(1) either way: two table lookups off board.Board.KingSquare
+// (itself already cached), not a scan.
 func materialAndPstScore(b *board.Board, phase int) int {
-	score := 0
-	for sqIdx, p := range b.Squares {
-		if p.IsNone() {
-			continue
-		}
-		v := pieceValue(p.Type()) + pstValue(p, board.Square(sqIdx), phase)
-		if p.Color() == board.White {
-			score += v
-		} else {
-			score -= v
-		}
+	score := b.MaterialPST()
+
+	if wk := b.KingSquare(board.White); wk != board.NoSquare {
+		score += pstValue(board.MakePiece(board.King, board.White), wk, phase)
+	}
+	if bk := b.KingSquare(board.Black); bk != board.NoSquare {
+		score -= pstValue(board.MakePiece(board.King, board.Black), bk, phase)
 	}
 	return score
 }
@@ -99,13 +105,14 @@ const maxPhase = 24
 // gamePhase counts how much non-pawn material remains on the board,
 // clamped to [0, maxPhase]. maxPhase means "still midgame material
 // out there", 0 means "no minor/major pieces left, deep endgame".
+// One Count() popcount per (piece type, color) pair instead of a
+// 64-square scan.
 func gamePhase(b *board.Board) int {
 	phase := 0
-	for _, p := range b.Squares {
-		if p.IsNone() {
-			continue
+	for _, color := range [2]board.Color{board.White, board.Black} {
+		for pt := board.Knight; pt <= board.Queen; pt++ {
+			phase += phaseWeight(pt) * b.Pieces(pt, color).Count()
 		}
-		phase += phaseWeight(p.Type())
 	}
 	if phase > maxPhase {
 		phase = maxPhase
@@ -114,16 +121,22 @@ func gamePhase(b *board.Board) int {
 }
 
 // Evaluate returns a centipawn score from the perspective of the side
-// to move: positive means the side to move is ahead.
+// to move: positive means the side to move is ahead. cache, when
+// non-nil, is used for pawn-structure scoring — see PawnCache's own
+// doc comment for what it's for and why it's threaded in here rather
+// than kept as a package-level global. Passing nil (as every existing
+// eval package test does) just means pawn structure gets recomputed
+// from scratch every call, same as before caching existed — never
+// wrong, only slower.
 //
 // TODO(later steps): real king danger from actual enemy attackers
 // (not just open/semi-open files), space, outposts.
-func Evaluate(b *board.Board) int {
+func Evaluate(b *board.Board, cache *PawnCache) int {
 	phase := gamePhase(b)
 
 	score := materialAndPstScore(b, phase)
 	score += mobilityScore(b)
-	score += pawnStructureScore(b)
+	score += pawnStructureScore(b, cache)
 	score += kingSafetyScore(b, phase)
 	score += bishopPairScore(b)
 	score += mopupScore(b, phase)

@@ -102,6 +102,32 @@ func mirror(sq board.Square) board.Square {
 	return board.Square(int(sq) ^ 56)
 }
 
+// init registers this package's real material+PST values as
+// board.Board's incremental materialPST hook (see
+// board/material_hook.go) — the one piece of wiring that lets Board
+// track material+PST incrementally through MakeMove/UnmakeMove/
+// SetSquare without board itself knowing what a piece is "worth".
+//
+// Returns 0 for King: its positional value depends on `phase`, a
+// board-wide quantity that changes on every non-pawn capture or
+// promotion anywhere on the board, not just when the king itself
+// moves — see PieceValue's own doc comment in material_hook.go for
+// why that rules out a per-square incremental hook for it.
+// materialAndPstScore below computes the king's own term itself,
+// separately, directly from board.Board.KingSquare (already O(1), no
+// scan needed) and the CURRENT phase at evaluation time.
+func init() {
+	board.SetPieceValueHook(func(p board.Piece, sq board.Square) int {
+		if p.Type() == board.King {
+			return 0
+		}
+		// phase=0 is safe here: every switch branch in pstValue below
+		// except King's ignores the phase argument entirely, and this
+		// hook never gets called for King (see the check just above).
+		return pieceValue(p.Type()) + pstValue(p, sq, 0)
+	})
+}
+
 // pstValue looks up a piece's positional bonus/penalty on sq. phase is
 // the value returned by gamePhase, passed in so it's only computed
 // once per Evaluate call rather than once per piece.

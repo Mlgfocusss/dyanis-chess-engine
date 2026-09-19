@@ -28,6 +28,12 @@ export default function App() {
   const [useMovetime, setUseMovetime] = useState(true);
   const [movetimeMs, setMovetimeMs] = useState(DEFAULT_MOVETIME_MS);
 
+  // Custom-position loading: a plain FEN text field. Kept as its own
+  // piece of state (not derived from `state.fen`) so typing/pasting
+  // into it doesn't fight with the board's own current position —
+  // it's only read when "Загрузить FEN" is actually clicked.
+  const [fenInput, setFenInput] = useState("");
+
   const refreshBook = useCallback(() => {
     engine
       .bookInfoInWorker()
@@ -116,6 +122,34 @@ export default function App() {
     triggerEngineIfNeeded(s);
   }
 
+  // jsNewGame (see cmd/wasm/main.go) returns either a full stateResponse
+  // (success — no "ok" field at all) or {ok:false, error} (bad FEN) —
+  // unlike the no-arg call in handleNewGame above, which is always the
+  // starting position and can't fail, this one has to check which shape
+  // came back before treating the result as a position to render.
+  function handleLoadPosition() {
+    const fen = fenInput.trim();
+    if (!fen) return;
+    const s = engine.newGame(fen);
+    if (s.ok === false) {
+      setError(`неверный FEN: ${s.error}`);
+      return;
+    }
+    setState(s);
+    setLastMove(null);
+    setEngineNote("");
+    setError(null);
+    triggerEngineIfNeeded(s);
+  }
+
+  // Pulls the FEN of the position currently on the board into the
+  // input field — handy for saving a position you just reached (e.g.
+  // right before the engine's move you want to re-examine) so you can
+  // reload it later, at a different depth, without replaying the game.
+  function handleCopyCurrentFen() {
+    if (state) setFenInput(state.fen);
+  }
+
   function handleUndo() {
     const result = engine.undo();
     if (result.ok) {
@@ -196,6 +230,28 @@ export default function App() {
             <button onClick={handleUndo} disabled={thinking}>
               Отменить ход
             </button>
+
+            <div className="fen-controls">
+              <label className="fen-controls__row">
+                FEN:
+                <input
+                  type="text"
+                  className="fen-controls__input"
+                  value={fenInput}
+                  onChange={(e) => setFenInput(e.target.value)}
+                  placeholder="вставь позицию сюда"
+                  disabled={thinking}
+                />
+              </label>
+              <div className="fen-controls__buttons">
+                <button onClick={handleLoadPosition} disabled={thinking || !fenInput.trim()}>
+                  Загрузить FEN
+                </button>
+                <button onClick={handleCopyCurrentFen} disabled={thinking}>
+                  Скопировать текущий FEN
+                </button>
+              </div>
+            </div>
 
             <div className="side-toggle">
               <label>

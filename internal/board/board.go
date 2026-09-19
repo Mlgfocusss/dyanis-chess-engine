@@ -161,7 +161,7 @@ const (
 // Board is the full state needed to make/unmake moves and to resume
 // play from any position (this mirrors what a FEN string encodes).
 type Board struct {
-	Squares [64]Piece
+	squares [64]Piece
 
 	SideToMove Color
 
@@ -200,7 +200,7 @@ type Board struct {
 	// same as hash.
 	//
 	// NOT trusted blindly, though: a Board built via a raw struct
-	// literal (several tests do this — set up Squares directly without
+	// literal (several tests do this — set up squares directly without
 	// going through NewInitialBoard/FromFEN) leaves this at its zero
 	// value, Square(0) = a1, which is not NoSquare and could easily be
 	// wrong. KingSquare() verifies the cached square still actually
@@ -209,6 +209,51 @@ type Board struct {
 	// — so this is a pure performance cache, never a correctness
 	// requirement on how a Board gets built.
 	kingSq [2]Square
+
+	// bb is a full bitboard snapshot of this exact position — one
+	// Bitboard per (piece type, color), plus per-color and combined
+	// occupancy (see bitboard.go). Maintained INCREMENTALLY by
+	// MakeMove/UnmakeMove wherever they mutate squares, the same
+	// discipline hash already follows (see hash's own comment above):
+	// every put/remove/move on bb sits right next to the matching
+	// squares assignment in move.go, rather than being derived by a
+	// full rebuildBitboards() walk on every call. MakeNullMove/
+	// UnmakeNullMove don't touch it, same reasoning as kingSq — a null
+	// move never relocates a piece.
+	//
+	// Every code path that builds a Board from nothing
+	// (NewInitialBoard, FromFEN) seeds this once via rebuildBitboards,
+	// the same way those two seed hash via computeHashFromScratch.
+	// Copy() carries it along automatically, being a plain value type
+	// with no pointers or slices.
+	//
+	// Not yet read by anything outside this package or by
+	// IsSquareAttacked/movegen — those still work the way they always
+	// have. This field exists purely so the incremental bookkeeping in
+	// move.go can be trusted (via VerifyBitboards, run across perft
+	// the same way VerifyHash is) before anything starts depending on
+	// it for real. A Board built via a raw struct literal (as two
+	// existing test helpers do, in zobrist_test.go and eval_test.go)
+	// leaves this at its zero value — which is correct as long as
+	// those helpers also leave squares all-empty, which they do; if a
+	// future raw-literal helper ever populates squares by hand without
+	// going through NewInitialBoard/FromFEN, VerifyBitboards on that
+	// Board would (correctly) report a mismatch.
+	bb bitboards
+
+	// materialPST is the incrementally-maintained White-minus-Black
+	// sum of PieceValue (material_hook.go) over every piece on the
+	// board — everything except the king, which PieceValue always
+	// returns 0 for (see its own doc comment for why: its positional
+	// value depends on the board-wide `phase`, not just its own
+	// square, so it can't be tracked incrementally per-square the way
+	// everything else here can). Maintained the same way hash and bb
+	// are: addPieceValue/removePieceValue sit right next to the
+	// matching bb.put/remove/move call in move.go and bitboard.go's
+	// SetSquare, and NewInitialBoard/FromFEN seed it once via
+	// rebuildMaterialPST, the same role computeHashFromScratch/
+	// rebuildBitboards play for those two fields.
+	materialPST int
 }
 
 // NewInitialBoard returns the standard starting position.
@@ -223,14 +268,16 @@ func NewInitialBoard() *Board {
 
 	backRank := []PieceType{Rook, Knight, Bishop, Queen, King, Bishop, Knight, Rook}
 	for file := 0; file < 8; file++ {
-		b.Squares[MakeSquare(file, 0)] = MakePiece(backRank[file], White)
-		b.Squares[MakeSquare(file, 1)] = MakePiece(Pawn, White)
-		b.Squares[MakeSquare(file, 6)] = MakePiece(Pawn, Black)
-		b.Squares[MakeSquare(file, 7)] = MakePiece(backRank[file], Black)
+		b.squares[MakeSquare(file, 0)] = MakePiece(backRank[file], White)
+		b.squares[MakeSquare(file, 1)] = MakePiece(Pawn, White)
+		b.squares[MakeSquare(file, 6)] = MakePiece(Pawn, Black)
+		b.squares[MakeSquare(file, 7)] = MakePiece(backRank[file], Black)
 	}
 	b.kingSq[White] = MakeSquare(4, 0) // e1
 	b.kingSq[Black] = MakeSquare(4, 7) // e8
 	b.hash = b.computeHashFromScratch()
+	b.bb = b.rebuildBitboards()
+	b.materialPST = b.rebuildMaterialPST()
 	return b
 }
 
@@ -248,7 +295,23 @@ func (b *Board) Copy() *Board {
 
 // PieceAt returns the piece on a square (None if empty).
 func (b *Board) PieceAt(sq Square) Piece {
-	return b.Squares[sq]
+	return b.squares[sq]
+}
+
+// SquaresArray returns a copy of the full 64-square mailbox, for code
+// that needs to scan every square (eval's material/mobility/pawn-
+// structure terms, search's SEE working copy) rather than look up one
+// square at a time (PieceAt does that). A copy, not a reference to the
+// real board — [64]Piece is an array, and arrays copy on assignment/
+// return in Go, the same fact Board.Copy() and SEE's own working copy
+// already rely on — so mutating the result never touches b itself.
+// This is the supported replacement for ranging over b.squares
+// directly from outside package board (see SetSquare's doc comment
+// for why direct field access, in either direction, stopped being
+// safe once Board started keeping a second representation (bb)
+// alongside squares).
+func (b *Board) SquaresArray() [64]Piece {
+	return b.squares
 }
 
 // KingSquare finds the square of the given color's king. Returns
@@ -263,11 +326,11 @@ func (b *Board) PieceAt(sq Square) Piece {
 // Board take the fast path.
 func (b *Board) KingSquare(c Color) Square {
 	want := MakePiece(King, c)
-	if sq := b.kingSq[c]; sq != NoSquare && b.Squares[sq] == want {
+	if sq := b.kingSq[c]; sq != NoSquare && b.squares[sq] == want {
 		return sq
 	}
 	for sq := Square(0); sq < 64; sq++ {
-		if b.Squares[sq] == want {
+		if b.squares[sq] == want {
 			b.kingSq[c] = sq
 			return sq
 		}
@@ -282,7 +345,7 @@ func (b *Board) String() string {
 	for rank := 7; rank >= 0; rank-- {
 		s += fmt.Sprintf("%d  ", rank+1)
 		for file := 0; file < 8; file++ {
-			s += b.Squares[MakeSquare(file, rank)].String() + " "
+			s += b.squares[MakeSquare(file, rank)].String() + " "
 		}
 		s += "\n"
 	}

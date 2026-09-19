@@ -42,14 +42,15 @@ const (
 
 // nonKingMaterial sums plain piece values (pieceValue, from eval.go —
 // not the PST-adjusted score) for one color, excluding the king,
-// which pieceValue already treats as worth 0.
+// which pieceValue already treats as worth 0. One Bitboard.Count()
+// popcount per piece type instead of a 64-square scan — this runs
+// unconditionally on every node (see mopupScore), including the vast
+// majority of positions where mop-up isn't remotely eligible, so
+// keeping it cheap matters even though the term itself rarely fires.
 func nonKingMaterial(b *board.Board, color board.Color) int {
 	total := 0
-	for _, p := range b.Squares {
-		if p.IsNone() || p.Color() != color {
-			continue
-		}
-		total += pieceValue(p.Type())
+	for pt := board.Pawn; pt <= board.Queen; pt++ {
+		total += pieceValue(pt) * b.Pieces(pt, color).Count()
 	}
 	return total
 }

@@ -269,7 +269,7 @@ func (b *Board) Hash() uint64 {
 func (b *Board) computeHashFromScratch() uint64 {
 	var h uint64
 
-	for sq, p := range b.Squares {
+	for sq, p := range b.squares {
 		if p.IsNone() {
 			continue
 		}
@@ -334,7 +334,7 @@ func enPassantCaptureIsPossible(b *Board) bool {
 		if f < 0 || f > 7 {
 			continue
 		}
-		if b.Squares[MakeSquare(f, capturingRank)] == pawn {
+		if b.squares[MakeSquare(f, capturingRank)] == pawn {
 			return true
 		}
 	}

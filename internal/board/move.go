@@ -144,6 +144,7 @@ type Undo struct {
 	HalfmoveClockBefore  int
 	FullmoveNumberBefore int
 	HashBefore           uint64
+	MaterialPSTBefore    int
 }
 
 // MakeMove applies m to the board IN PLACE and returns an Undo that
@@ -156,7 +157,7 @@ type Undo struct {
 // that examine it return), the same "make, look, unmake" discipline
 // negamax and GenerateLegalMoves below follow.
 func (b *Board) MakeMove(m Move) Undo {
-	mover := b.Squares[m.From]
+	mover := b.squares[m.From]
 	movingColor := mover.Color()
 
 	undo := Undo{
@@ -167,6 +168,7 @@ func (b *Board) MakeMove(m Move) Undo {
 		HalfmoveClockBefore:  b.HalfmoveClock,
 		FullmoveNumberBefore: b.FullmoveNumber,
 		HashBefore:           b.hash,
+		MaterialPSTBefore:    b.materialPST,
 	}
 
 	// Incremental hash update, old en passant contribution: remove
@@ -198,61 +200,86 @@ func (b *Board) MakeMove(m Move) Undo {
 		// The captured pawn is NOT on the destination square: it sits
 		// on the same rank as the moving pawn, same file as the target.
 		capturedSq := MakeSquare(m.To.File(), m.From.Rank())
-		captured := b.Squares[capturedSq]
+		captured := b.squares[capturedSq]
 		undo.CapturedPiece = captured
 		undo.CapturedSquare = capturedSq
 		b.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(capturedSq)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		b.Squares[capturedSq] = None
-		b.Squares[m.To] = mover
-		b.Squares[m.From] = None
+		b.bb.remove(captured, capturedSq)
+		b.bb.move(mover, m.From, m.To)
+		b.removePieceValue(captured, capturedSq)
+		b.removePieceValue(mover, m.From)
+		b.addPieceValue(mover, m.To)
+		b.squares[capturedSq] = None
+		b.squares[m.To] = mover
+		b.squares[m.From] = None
 
 	case CastleKingside, CastleQueenside:
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		b.Squares[m.To] = mover
-		b.Squares[m.From] = None
+		b.bb.move(mover, m.From, m.To)
+		b.removePieceValue(mover, m.From)
+		b.addPieceValue(mover, m.To)
+		b.squares[m.To] = mover
+		b.squares[m.From] = None
 		rFrom, rTo := rookSquaresForCastle(movingColor, m.Flag)
-		rook := b.Squares[rFrom]
+		rook := b.squares[rFrom]
 		b.hash ^= polyglotRandom64[64*pieceIndex(rook)+int(rFrom)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(rook)+int(rTo)]
-		b.Squares[rTo] = rook
-		b.Squares[rFrom] = None
+		b.bb.move(rook, rFrom, rTo)
+		b.removePieceValue(rook, rFrom)
+		b.addPieceValue(rook, rTo)
+		b.squares[rTo] = rook
+		b.squares[rFrom] = None
 
 	case Promotion, PromotionCapture:
 		if m.Flag == PromotionCapture {
-			captured := b.Squares[m.To]
+			captured := b.squares[m.To]
 			undo.CapturedPiece = captured
 			undo.CapturedSquare = m.To
 			b.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(m.To)]
+			b.bb.remove(captured, m.To)
+			b.removePieceValue(captured, m.To)
 		}
 		promoted := MakePiece(m.Promotion, movingColor)
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(promoted)+int(m.To)]
-		b.Squares[m.To] = promoted
-		b.Squares[m.From] = None
+		b.bb.remove(mover, m.From)
+		b.bb.put(promoted, m.To)
+		b.removePieceValue(mover, m.From)
+		b.addPieceValue(promoted, m.To)
+		b.squares[m.To] = promoted
+		b.squares[m.From] = None
 
 	case DoublePawnPush:
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		b.Squares[m.To] = mover
-		b.Squares[m.From] = None
+		b.bb.move(mover, m.From, m.To)
+		b.removePieceValue(mover, m.From)
+		b.addPieceValue(mover, m.To)
+		b.squares[m.To] = mover
+		b.squares[m.From] = None
 		// The en passant target is the square the pawn "skipped over".
 		skipped := (int(m.From) + int(m.To)) / 2
 		b.EnPassant = Square(skipped)
 
 	default: // Quiet, Capture
 		if m.Flag == Capture {
-			captured := b.Squares[m.To]
+			captured := b.squares[m.To]
 			undo.CapturedPiece = captured
 			undo.CapturedSquare = m.To
 			b.hash ^= polyglotRandom64[64*pieceIndex(captured)+int(m.To)]
+			b.bb.remove(captured, m.To)
+			b.removePieceValue(captured, m.To)
 		}
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.From)]
 		b.hash ^= polyglotRandom64[64*pieceIndex(mover)+int(m.To)]
-		b.Squares[m.To] = mover
-		b.Squares[m.From] = None
+		b.bb.move(mover, m.From, m.To)
+		b.removePieceValue(mover, m.From)
+		b.addPieceValue(mover, m.To)
+		b.squares[m.To] = mover
+		b.squares[m.From] = None
 	}
 
 	// King-square cache: only Quiet/Capture/CastleKingside/
@@ -330,34 +357,45 @@ func (b *Board) UnmakeMove(m Move, u Undo) {
 
 	switch m.Flag {
 	case EnPassantCapture:
-		b.Squares[m.From] = u.MovedPiece
-		b.Squares[m.To] = None
-		b.Squares[u.CapturedSquare] = u.CapturedPiece
+		b.bb.move(u.MovedPiece, m.To, m.From)
+		b.bb.put(u.CapturedPiece, u.CapturedSquare)
+		b.squares[m.From] = u.MovedPiece
+		b.squares[m.To] = None
+		b.squares[u.CapturedSquare] = u.CapturedPiece
 
 	case CastleKingside, CastleQueenside:
-		b.Squares[m.From] = u.MovedPiece
-		b.Squares[m.To] = None
+		b.bb.move(u.MovedPiece, m.To, m.From)
+		b.squares[m.From] = u.MovedPiece
+		b.squares[m.To] = None
 		rFrom, rTo := rookSquaresForCastle(movingColor, m.Flag)
-		b.Squares[rFrom] = b.Squares[rTo]
-		b.Squares[rTo] = None
+		rook := b.squares[rTo]
+		b.bb.move(rook, rTo, rFrom)
+		b.squares[rFrom] = rook
+		b.squares[rTo] = None
 
 	case Promotion, PromotionCapture:
 		// The pawn goes back on m.From — MovedPiece was captured
 		// BEFORE promotion happened, so it's still the pawn, never the
 		// promoted piece.
-		b.Squares[m.From] = u.MovedPiece
+		promoted := b.squares[m.To] // the piece MakeMove put there
+		b.bb.remove(promoted, m.To)
+		b.bb.put(u.MovedPiece, m.From)
+		b.squares[m.From] = u.MovedPiece
 		if m.Flag == PromotionCapture {
-			b.Squares[m.To] = u.CapturedPiece
+			b.bb.put(u.CapturedPiece, m.To)
+			b.squares[m.To] = u.CapturedPiece
 		} else {
-			b.Squares[m.To] = None
+			b.squares[m.To] = None
 		}
 
 	default: // Quiet, Capture, DoublePawnPush
-		b.Squares[m.From] = u.MovedPiece
+		b.bb.move(u.MovedPiece, m.To, m.From)
+		b.squares[m.From] = u.MovedPiece
 		if m.Flag == Capture {
-			b.Squares[m.To] = u.CapturedPiece
+			b.bb.put(u.CapturedPiece, m.To)
+			b.squares[m.To] = u.CapturedPiece
 		} else {
-			b.Squares[m.To] = None
+			b.squares[m.To] = None
 		}
 	}
 
@@ -376,6 +414,7 @@ func (b *Board) UnmakeMove(m Move, u Undo) {
 	b.HalfmoveClock = u.HalfmoveClockBefore
 	b.FullmoveNumber = u.FullmoveNumberBefore
 	b.hash = u.HashBefore
+	b.materialPST = u.MaterialPSTBefore
 	b.SideToMove = movingColor
 }
 

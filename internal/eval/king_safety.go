@@ -20,16 +20,15 @@ func kingSafetyScore(b *board.Board, phase int) int {
 		return 0
 	}
 
-	white, black := buildPawnMaps(b)
-	whiteFiles := fileCounts(white)
-	blackFiles := fileCounts(black)
+	whitePawns := b.Pieces(board.Pawn, board.White)
+	blackPawns := b.Pieces(board.Pawn, board.Black)
 
 	raw := 0
 	if wk := b.KingSquare(board.White); wk != board.NoSquare {
-		raw += kingSafetyTerm(wk, board.White, white, whiteFiles, blackFiles)
+		raw += kingSafetyTerm(wk, board.White, whitePawns, blackPawns)
 	}
 	if bk := b.KingSquare(board.Black); bk != board.NoSquare {
-		raw -= kingSafetyTerm(bk, board.Black, black, blackFiles, whiteFiles)
+		raw -= kingSafetyTerm(bk, board.Black, blackPawns, whitePawns)
 	}
 
 	return raw * phase / maxPhase
@@ -40,7 +39,7 @@ func kingSafetyScore(b *board.Board, phase int) int {
 // front of it, and a penalty for each nearby file (its own plus the
 // two beside it) that's open or semi-open — a lane an enemy rook or
 // queen could use without a pawn ever getting in the way.
-func kingSafetyTerm(kingSq board.Square, color board.Color, ownPawns pawnMap, ownFiles, enemyFiles [8]int) int {
+func kingSafetyTerm(kingSq board.Square, color board.Color, ownPawns, enemyPawns board.Bitboard) int {
 	file, rank := kingSq.File(), kingSq.Rank()
 	score := 0
 
@@ -53,7 +52,7 @@ func kingSafetyTerm(kingSq board.Square, color board.Color, ownPawns pawnMap, ow
 			if f < 0 || f > 7 {
 				continue
 			}
-			if ownPawns[f][shieldRank] {
+			if ownPawns.Test(board.MakeSquare(f, shieldRank)) {
 				score += shieldPawnBonus
 			}
 		}
@@ -63,8 +62,8 @@ func kingSafetyTerm(kingSq board.Square, color board.Color, ownPawns pawnMap, ow
 		if f < 0 || f > 7 {
 			continue
 		}
-		ownHere := ownFiles[f] > 0
-		enemyHere := enemyFiles[f] > 0
+		ownHere := ownPawns&fileMask[f] != 0
+		enemyHere := enemyPawns&fileMask[f] != 0
 		switch {
 		case !ownHere && !enemyHere:
 			score -= openFileKingPenalty

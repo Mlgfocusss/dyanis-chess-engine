@@ -46,7 +46,7 @@ func FromFEN(fen string) (*Board, error) {
 			if file > 7 {
 				return nil, fmt.Errorf("invalid FEN rank (too long): %q", rankStr)
 			}
-			b.Squares[MakeSquare(file, rank)] = piece
+			b.squares[MakeSquare(file, rank)] = piece
 			file++
 		}
 	}
@@ -104,6 +104,8 @@ func FromFEN(fen string) (*Board, error) {
 	}
 
 	b.hash = b.computeHashFromScratch()
+	b.bb = b.rebuildBitboards()
+	b.materialPST = b.rebuildMaterialPST()
 
 	return b, nil
 }
@@ -115,7 +117,7 @@ func (b *Board) ToFEN() string {
 	for rank := 7; rank >= 0; rank-- {
 		empty := 0
 		for file := 0; file < 8; file++ {
-			p := b.Squares[MakeSquare(file, rank)]
+			p := b.squares[MakeSquare(file, rank)]
 			if p.IsNone() {
 				empty++
 				continue

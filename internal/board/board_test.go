@@ -9,18 +9,18 @@ func TestInitialPosition(t *testing.T) {
 		t.Errorf("expected White to move first, got %v", b.SideToMove)
 	}
 
-	if b.Squares[MakeSquare(4, 0)] != WK {
-		t.Errorf("expected White king on e1, got %v", b.Squares[MakeSquare(4, 0)])
+	if b.PieceAt(MakeSquare(4, 0)) != WK {
+		t.Errorf("expected White king on e1, got %v", b.PieceAt(MakeSquare(4, 0)))
 	}
-	if b.Squares[MakeSquare(4, 7)] != BK {
-		t.Errorf("expected Black king on e8, got %v", b.Squares[MakeSquare(4, 7)])
+	if b.PieceAt(MakeSquare(4, 7)) != BK {
+		t.Errorf("expected Black king on e8, got %v", b.PieceAt(MakeSquare(4, 7)))
 	}
 
 	for file := 0; file < 8; file++ {
-		if b.Squares[MakeSquare(file, 1)] != WP {
+		if b.PieceAt(MakeSquare(file, 1)) != WP {
 			t.Errorf("expected White pawn on file %d rank 2", file)
 		}
-		if b.Squares[MakeSquare(file, 6)] != BP {
+		if b.PieceAt(MakeSquare(file, 6)) != BP {
 			t.Errorf("expected Black pawn on file %d rank 7", file)
 		}
 	}

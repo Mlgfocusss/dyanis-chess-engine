@@ -65,7 +65,7 @@ func TestCastlingAvailable(t *testing.T) {
 	// Empty the squares between White king and both rooks: b1,c1,d1,f1,g1
 	for _, s := range []string{"b1", "c1", "d1", "f1", "g1"} {
 		sq, _ := board.ParseSquare(s)
-		b.Squares[sq] = board.None
+		b.SetSquare(sq, board.None)
 	}
 
 	foundKingside, foundQueenside := false, false

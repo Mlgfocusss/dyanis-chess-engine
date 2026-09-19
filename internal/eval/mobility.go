@@ -20,41 +20,23 @@ const (
 	queenMobilityWeight  = 1
 )
 
-var knightOffsets = [8][2]int{
-	{1, 2}, {2, 1}, {2, -1}, {1, -2},
-	{-1, -2}, {-2, -1}, {-2, 1}, {-1, 2},
-}
-
-var bishopDirs = [4][2]int{{1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
-var rookDirs = [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
-
-func onBoard(file, rank int) bool {
-	return file >= 0 && file < 8 && rank >= 0 && rank < 8
-}
-
-// pawnAttackSquares reports, for each color, which squares that
-// color's pawns attack. Computed once per Evaluate call (like
-// gamePhase) and shared by every piece's mobility count below instead
-// of being re-derived per piece.
-func pawnAttackSquares(b *board.Board) (white, black [64]bool) {
-	for sqIdx, p := range b.Squares {
-		if p.Type() != board.Pawn {
-			continue
-		}
-		s := board.Square(sqIdx)
-		file, rank := s.File(), s.Rank()
-		dir := 1
-		target := &white
-		if p.Color() == board.Black {
-			dir = -1
-			target = &black
-		}
-		for _, df := range []int{-1, 1} {
-			f, r := file+df, rank+dir
-			if onBoard(f, r) {
-				target[board.MakeSquare(f, r)] = true
-			}
-		}
+// pawnAttackSquares reports, for each color, the full bitboard of
+// squares that color's pawns attack — every pawn's board.PawnAttacks
+// ORed together. Computed once per Evaluate call (like gamePhase) and
+// shared by every piece's mobility count below instead of being
+// re-derived per piece.
+func pawnAttackSquares(b *board.Board) (white, black board.Bitboard) {
+	wp := b.Pieces(board.Pawn, board.White)
+	for wp != 0 {
+		var sq board.Square
+		sq, wp = wp.PopLSB()
+		white |= board.PawnAttacks(board.White, sq)
+	}
+	bp := b.Pieces(board.Pawn, board.Black)
+	for bp != 0 {
+		var sq board.Square
+		sq, bp = bp.PopLSB()
+		black |= board.PawnAttacks(board.Black, sq)
 	}
 	return white, black
 }
@@ -62,56 +44,29 @@ func pawnAttackSquares(b *board.Board) (white, black [64]bool) {
 // knightMobility counts squares a knight on s could move or capture
 // to, excluding squares occupied by its own side and squares an enemy
 // pawn attacks — a knight that's only "mobile" into a square it gets
-// immediately traded off of isn't really mobile.
-func knightMobility(b *board.Board, s board.Square, color board.Color, enemyPawnAtk *[64]bool) int {
-	count := 0
-	file, rank := s.File(), s.Rank()
-	for _, o := range knightOffsets {
-		f, r := file+o[0], rank+o[1]
-		if !onBoard(f, r) {
-			continue
-		}
-		dest := board.MakeSquare(f, r)
-		if enemyPawnAtk[dest] {
-			continue
-		}
-		occ := b.Squares[dest]
-		if occ.IsNone() || occ.Color() != color {
-			count++
-		}
-	}
-	return count
+// immediately traded off of isn't really mobile. board.KnightAttacks
+// already gives the full destination set as one table lookup; this is
+// just that set with the two exclusions masked off and popcounted.
+func knightMobility(b *board.Board, s board.Square, color board.Color, enemyPawnAtk board.Bitboard) int {
+	targets := board.KnightAttacks(s) &^ b.OccupiedBy(color) &^ enemyPawnAtk
+	return targets.Count()
 }
 
-// slidingMobility counts reachable squares along the given ray
-// directions (bishop or rook directions; queen calls both), stopping
-// at the first blocker in each direction the way real sliding moves
-// do. Squares an enemy pawn attacks aren't counted (same "safe
-// mobility" idea as knightMobility), but an occupied square still
-// blocks the ray whether or not it counts.
-func slidingMobility(b *board.Board, s board.Square, color board.Color, dirs [4][2]int, enemyPawnAtk *[64]bool) int {
-	count := 0
-	file, rank := s.File(), s.Rank()
-	for _, d := range dirs {
-		f, r := file+d[0], rank+d[1]
-		for onBoard(f, r) {
-			dest := board.MakeSquare(f, r)
-			occ := b.Squares[dest]
-			if occ.IsNone() {
-				if !enemyPawnAtk[dest] {
-					count++
-				}
-				f += d[0]
-				r += d[1]
-				continue
-			}
-			if occ.Color() != color && !enemyPawnAtk[dest] {
-				count++
-			}
-			break
-		}
-	}
-	return count
+// slidingMobility counts reachable squares from a bishop/rook/queen's
+// attack bitboard (already blocker-aware — see board.BishopAttacks/
+// RookAttacks/QueenAttacks, which stop at the first occupied square
+// same as a real move would), excluding the mover's own pieces and
+// squares an enemy pawn attacks (same "safe mobility" idea as
+// knightMobility). Unlike the old ray-walk version, there's no
+// separate "count this square but keep going" step needed: an
+// enemy-pawn-attacked square that's otherwise empty still isn't a
+// blocker, so it's already included in attacks and simply gets masked
+// out of the count here without truncating the ray — exactly the
+// original behavior, just derived from one magic lookup instead of a
+// hand-walked loop.
+func slidingMobility(b *board.Board, attacks board.Bitboard, color board.Color, enemyPawnAtk board.Bitboard) int {
+	targets := attacks &^ b.OccupiedBy(color) &^ enemyPawnAtk
+	return targets.Count()
 }
 
 // mobilityScore returns White-minus-Black mobility bonus in
@@ -122,38 +77,43 @@ func slidingMobility(b *board.Board, s board.Square, color board.Color, dirs [4]
 // signal — king safety gets its own term instead).
 func mobilityScore(b *board.Board) int {
 	whitePawnAtk, blackPawnAtk := pawnAttackSquares(b)
+	occ := b.Occupied()
 
 	score := 0
-	for sqIdx, p := range b.Squares {
-		if p.IsNone() {
-			continue
-		}
-		s := board.Square(sqIdx)
-		enemyPawnAtk := &blackPawnAtk
-		if p.Color() == board.Black {
-			enemyPawnAtk = &whitePawnAtk
+	for _, color := range [2]board.Color{board.White, board.Black} {
+		sign := 1
+		enemyPawnAtk := blackPawnAtk
+		if color == board.Black {
+			sign = -1
+			enemyPawnAtk = whitePawnAtk
 		}
 
-		var v int
-		switch p.Type() {
-		case board.Knight:
-			v = knightMobilityWeight * knightMobility(b, s, p.Color(), enemyPawnAtk)
-		case board.Bishop:
-			v = bishopMobilityWeight * slidingMobility(b, s, p.Color(), bishopDirs, enemyPawnAtk)
-		case board.Rook:
-			v = rookMobilityWeight * slidingMobility(b, s, p.Color(), rookDirs, enemyPawnAtk)
-		case board.Queen:
-			diag := slidingMobility(b, s, p.Color(), bishopDirs, enemyPawnAtk)
-			straight := slidingMobility(b, s, p.Color(), rookDirs, enemyPawnAtk)
-			v = queenMobilityWeight * (diag + straight)
-		default:
-			continue
+		knights := b.Pieces(board.Knight, color)
+		for knights != 0 {
+			var sq board.Square
+			sq, knights = knights.PopLSB()
+			score += sign * knightMobilityWeight * knightMobility(b, sq, color, enemyPawnAtk)
 		}
 
-		if p.Color() == board.White {
-			score += v
-		} else {
-			score -= v
+		bishops := b.Pieces(board.Bishop, color)
+		for bishops != 0 {
+			var sq board.Square
+			sq, bishops = bishops.PopLSB()
+			score += sign * bishopMobilityWeight * slidingMobility(b, board.BishopAttacks(sq, occ), color, enemyPawnAtk)
+		}
+
+		rooks := b.Pieces(board.Rook, color)
+		for rooks != 0 {
+			var sq board.Square
+			sq, rooks = rooks.PopLSB()
+			score += sign * rookMobilityWeight * slidingMobility(b, board.RookAttacks(sq, occ), color, enemyPawnAtk)
+		}
+
+		queens := b.Pieces(board.Queen, color)
+		for queens != 0 {
+			var sq board.Square
+			sq, queens = queens.PopLSB()
+			score += sign * queenMobilityWeight * slidingMobility(b, board.QueenAttacks(sq, occ), color, enemyPawnAtk)
 		}
 	}
 	return score
