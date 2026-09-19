@@ -268,9 +268,6 @@ func (tt *TranspositionTable) probe(hash uint64) (ttEntry, bool) {
 	return e, true
 }
 
-// store writes e into hash's slot, unconditionally overwriting
-// whatever (if anything) was there before — see the type's own doc
-// comment for why "always replace" rather than a fancier scheme.
 // store writes e into hash's slot — unless a DIFFERENT position
 // already sits there with a greater search depth, in which case that
 // existing entry is worth more (took more work to produce, and is
@@ -570,18 +567,16 @@ func BestMoveTimedInfo(b *board.Board, maxDepth int, budget time.Duration, onInf
 // enough to stay safe without a verification search on top.
 const nullMoveReduction = 2
 
-// nullMoveMinDepth is the shallowest depth NMP bothers attempting at.
-// With nullMoveReduction=2, this must be at least 3 for the reduced
-// search's depth (depth-1-nullMoveReduction) to never go negative.
+// nullMoveMinDepth is the shallowest depth NMP bothers attempting at
+// — must be at least nullMoveReduction+1 so depth-1-nullMoveReduction
+// never goes negative.
 const nullMoveMinDepth = 3
 
 // lmrMinDepth is the shallowest remaining depth Late Move Reductions
 // bothers attempting at — below this there's barely anything left to
 // shave off, so the extra branching (probe, maybe re-search) isn't
-// worth it. Kept at the same value as nullMoveMinDepth for the same
-// reason: with lmrReduction=1, depth-1-lmrReduction must stay >= 0,
-// which any depth >= 2 already guarantees, but 3 leaves headroom to
-// raise lmrReduction later without redoing this arithmetic.
+// worth it. Kept equal to nullMoveMinDepth, with headroom to raise
+// lmrReduction later without redoing this arithmetic.
 const lmrMinDepth = 3
 
 // lmrFullDepthMoves is how many moves at the front of the (already
@@ -609,13 +604,29 @@ const futilityMaxDepth = 3
 
 // futilityMargin[depth] is how many centipawns of swing a quiet move
 // is given the benefit of the doubt for, at that many plies of
-// remaining depth, before being judged futile. Index 0 is never used
-// (depth 0 hands off to quiescence before the move loop this applies
-// in is ever reached) — indices 1..futilityMaxDepth roughly track "a
-// deeper remaining search has more room to still turn things around,
-// so it earns a wider margin," on the same centipawn scale eval.go's
-// own piece values use (a pawn is 100).
+// remaining depth, before being judged futile (index 0 unused: depth
+// 0 hands off to quiescence first). Same centipawn scale as eval.go's
+// piece values (a pawn is 100); deeper remaining depth gets a wider
+// margin.
 var futilityMargin = [futilityMaxDepth + 1]int{0, 150, 300, 500}
+
+// razorMaxDepth is the deepest remaining depth razoring bothers
+// attempting at — same reasoning as futilityMaxDepth's own comment:
+// only very close to the leaves does a static snapshot plus a fixed
+// margin say anything reliable, here about the WHOLE node rather than
+// a single move.
+const razorMaxDepth = 3
+
+// razorMargin[depth] is how many centipawns below alpha the static
+// eval is allowed to sit, at that many plies of remaining depth,
+// before the node is judged not worth a full search at all (index 0
+// unused, same convention as futilityMargin — depth 0 already hands
+// off to quiescence before this is ever consulted). Wider than
+// futilityMargin at every depth: razoring is judging whether ANY move
+// at this node can make up the gap over a full remaining subtree,
+// not just whether one specific quiet move can, so it only fires on a
+// much larger shortfall.
+var razorMargin = [razorMaxDepth + 1]int{0, 300, 500, 900}
 
 // hasNonPawnMaterial reports whether color c has any piece besides
 // pawns and the king — the standard null-move pruning guard against
@@ -655,13 +666,8 @@ func hasNonPawnMaterial(b *board.Board, c board.Color) bool {
 // in practice every current caller passes one.
 //
 // isRoot must be true only for the top-level call (from BestMove/
-// BestMoveTimed) and false for every recursive call. It exists solely
-// to disable null-move pruning at the root — see the NMP comment
-// below for why: a null-move cutoff skips computing bestHere, which
-// is fine deep in the tree (parents only ever read a child's score,
-// never its move — see the move loop below), but BestMove reads the
-// ROOT call's returned move directly, so the root can never take that
-// shortcut.
+// BestMoveTimed) and false for every recursive call — see the NMP
+// guard below for why this matters.
 // ply is how many plies deep from the search ROOT this call is (0 at
 // the root, incremented by 1 on every recursive call — including the
 // null-move probe). It exists purely for mate-distance adjustment —
@@ -779,6 +785,38 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 		b.UnmakeNullMove(nullUndo)
 		if nullScore >= beta {
 			return beta, board.Move{}
+		}
+	}
+
+	// Razoring: futility pruning's mirror image, one level up. Futility
+	// pruning (further below) skips individual LATE quiet moves once
+	// the static eval plus a margin can't clear alpha; razoring skips
+	// the ENTIRE node's search at shallow remaining depth once the
+	// static eval plus a (wider — there's a whole subtree of moves to
+	// make up the gap with here, not just one) margin already falls
+	// short of alpha. Guarded the same way futility pruning is: away
+	// from the root (BestMove needs a real move back), away from check
+	// (a static snapshot says nothing useful while every reply is
+	// forced), and away from mate-score bounds (same reasoning).
+	//
+	// Not trusted on the raw static eval alone, though — that would
+	// risk missing a node where one tactical shot (a hanging piece
+	// grab, a good capture) actually closes the gap. A null-window
+	// quiescence probe at (alpha-1, alpha) re-checks the claim first:
+	// quiescence returning a score still below alpha confirms even the
+	// best available captures/check-evasions don't rescue the
+	// position, so its (mate-distance-correct, unlike the raw static
+	// eval) result is trusted as this node's score outright. A probe
+	// that reaches alpha instead means the margin was too pessimistic
+	// here, so the real move loop below runs as normal.
+	if !isRoot && !inCheck && depth <= razorMaxDepth &&
+		alpha > -MateScore && beta < MateScore {
+		razorEval := eval.Evaluate(b, tt.pawnCacheOrNil())
+		if razorEval+razorMargin[depth] < alpha {
+			score := quiescence(b, ply, alpha-1, alpha, tt)
+			if score < alpha {
+				return score, board.Move{}
+			}
 		}
 	}
 
@@ -976,8 +1014,8 @@ func negamax(b *board.Board, depth, ply, alpha, beta int, isRoot bool, tt *Trans
 //     earlier visit via a different move order)
 //  2. captures, ordered by MVV-LVA (Most Valuable Victim, Least
 //     Valuable Attacker) — try pxq before qxp
-//  3. killer moves: quiet moves that caused a beta cutoff in a
-//     sibling position at this same remaining depth
+//  3. killer moves: quiet moves that caused a beta cutoff at this
+//     same remaining depth (see TranspositionTable's doc comment)
 //  4. everything else, by history heuristic score (accumulated across
 //     the whole search, not just this depth)
 
@@ -1009,6 +1047,46 @@ func mvvLva(b *board.Board, m board.Move) int {
 	}
 	attackerType := b.PieceAt(m.From).Type()
 	return pieceOrderingValue[victimType]*10 - pieceOrderingValue[attackerType]
+}
+
+// deltaMargin is how many centipawns of headroom, beyond the captured
+// piece's raw ordering value, a capture is given the benefit of the
+// doubt for in quiescence's delta-pruning filter — covers both
+// pieceOrderingValue being a cheap ordering-only approximation (see
+// its own comment) and whatever small positional gain a capture might
+// carry beyond pure material.
+const deltaMargin = 200
+
+// deltaPrune reports whether a capture can be discarded in
+// quiescenceSearch WITHOUT ever running SEE on it: even in the most
+// optimistic case — the capture nets the full raw value of the piece
+// taken, no more — standPat plus that gain plus deltaMargin still
+// falls short of alpha, so no SEE outcome (which only ever simulates
+// the SAME exchange more precisely, never invents extra material)
+// could change that conclusion. A single table lookup here is far
+// cheaper than SEE's full exchange simulation, so this runs first and
+// only lets what survives it pay for a real SEE call — same "cheap
+// filter before the expensive one" shape as futility pruning's
+// staticEval check.
+//
+// Never prunes en passant (the captured pawn isn't on m.To — see
+// mvvLva's own comment — so PieceAt(m.To) would misread it as an
+// empty square, i.e. a free capture, rather than skip it outright) or
+// promotion-captures (the new queen's value swamps whatever this
+// margin is tuned for; the plain captured-piece value alone
+// understates the real gain and would prune genuinely good moves).
+// Both are rare enough in quiescence's capture lists that skipping
+// the optimization there costs nothing measurable.
+// deltaPruneHits is a TEMPORARY debug counter — how many times
+// deltaPrune actually fired during a search. Not meant to stay: added
+// only to verify the delta-pruning change is doing anything at all
+// (see the plan.md discussion), remove once confirmed.
+func deltaPrune(b *board.Board, m board.Move, standPat, alpha int) bool {
+	if m.Flag == board.EnPassantCapture || m.Flag == board.PromotionCapture {
+		return false
+	}
+	victimValue := pieceOrderingValue[b.PieceAt(m.To).Type()]
+	return standPat+victimValue+deltaMargin < alpha
 }
 
 // Score bands keep the four ordering tiers from ever overlapping:
@@ -1060,18 +1138,13 @@ func orderMoves(b *board.Board, moves []board.Move, ttMove board.Move, hasTTMove
 }
 
 // insertionSortByScoreDesc sorts moves and their parallel scores
-// slice in lockstep, descending by score, directly — replacing
-// sort.Sort over a moveScoreSorter (a concrete sort.Interface; see
-// its own now-removed comment for why that was already better than
-// sort.Slice's reflection-based swap). Move lists in this engine are
-// small — rarely more than a few dozen candidates at any node — well
-// below the size where sort.Sort's pdqsort dispatch (choosePivot,
-// partition, recursion) earns back its own overhead; Go's sort
-// package already falls back to a plain insertion sort internally for
-// small slices (visible as runtime.insertionSort in a profile of the
-// old sort.Sort-based version), so this just skips straight to that,
-// skipping both pdqsort's own bookkeeping AND the Len/Less/Swap
-// interface-method dispatch moveScoreSorter needed to get there.
+// slice in lockstep, descending by score, directly. Move lists in
+// this engine are small — rarely more than a few dozen candidates at
+// any node — well below the size where a general-purpose sort (with
+// its pivot selection, partitioning, and interface-method dispatch)
+// earns back its own overhead; Go's sort package already falls back
+// to a plain insertion sort internally for small slices, so this just
+// skips straight to that.
 func insertionSortByScoreDesc(moves []board.Move, scores []int) {
 	for i := 1; i < len(moves); i++ {
 		m, s := moves[i], scores[i]
@@ -1156,7 +1229,7 @@ func quiescenceSearch(b *board.Board, ply, alpha, beta, checkExtLeft int, tt *Tr
 				alpha = standPat
 			}
 			for _, m := range legal {
-				if m.IsCapture() && SEE(b, m) >= 0 {
+				if m.IsCapture() && !deltaPrune(b, m, standPat, alpha) && SEE(b, m) >= 0 {
 					candidates = append(candidates, m)
 				}
 			}
@@ -1204,6 +1277,9 @@ func quiescenceSearch(b *board.Board, ply, alpha, beta, checkExtLeft int, tt *Tr
 
 	var candidates []board.Move
 	for _, m := range movegen.GenerateLegalCaptures(b) {
+		if deltaPrune(b, m, standPat, alpha) {
+			continue
+		}
 		if SEE(b, m) >= 0 {
 			candidates = append(candidates, m)
 		}

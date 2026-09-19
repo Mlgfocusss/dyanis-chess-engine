@@ -45,8 +45,11 @@ func main() {
 	defer pprof.StopCPUProfile()
 
 	b := board.NewInitialBoard()
+	var lastInfo search.SearchInfo
 	start := time.Now()
-	move, err := search.BestMove(b, *depth)
+	move, err := search.BestMoveInfo(b, *depth, func(info search.SearchInfo) {
+		lastInfo = info
+	})
 	elapsed := time.Since(start)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "search error:", err)
@@ -54,5 +57,6 @@ func main() {
 	}
 
 	fmt.Printf("BestMove(depth=%d) from the starting position: %s (%s)\n", *depth, move.String(), elapsed)
+	fmt.Printf("nodes: %d  score: %d\n", lastInfo.Nodes, lastInfo.Score)
 	fmt.Printf("profile written to %s — now run: go tool pprof -top %s\n", *out, *out)
 }
